@@ -95,16 +95,17 @@ is deliberately not dereferenced into profile backups.
 
 ## Runtime
 
-The bundled runtime is Codex CLI 0.144.0 for x86_64 Linux (musl). The tracked
+The bundled runtime is Codex CLI 0.144.1 for x86_64 Linux (musl). The tracked
 runtime archive is split into Git-friendly parts. `doctor` reassembles it after
 a fresh clone and checks both archive and extracted-file SHA-256 manifests.
+The 0.144.0 split archive is retained as a rollback artifact.
 
 The runtime includes the companion code-mode host and the `rg`, `bwrap`, and
 `zsh` resources shipped by the installed `@openai/codex` platform package.
 
 On this GLIBC 2.35 host, the upstream `zsh` resource requires GLIBC 2.38 and is
 not executable. Its `shell_zsh_fork` and `unified_exec_zsh_fork` features are
-disabled by default in Codex 0.144.0; the normal shell backend, `rg`, and `bwrap`
+disabled by default in Codex 0.144.1; the normal shell backend, `rg`, and `bwrap`
 remain available. `doctor` reports this optional-resource compatibility status.
 
 ## Safety defaults
