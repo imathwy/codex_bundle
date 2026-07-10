@@ -22,8 +22,11 @@ for the allowlisted state names. Other profile symlinks must remain in the
 profile, except the allowlisted launcher link to the bundled runtime and uv's
 cached `bin/python*` links below profile-local `.cache/uv` or `.codex/uv_cache`
 when they resolve to executable system Python interpreters under `/usr/bin` or
-`/usr/local/bin`. Shared state itself may not link outside its
-root.
+`/usr/local/bin`. Shared state itself may not link outside its root.
+
+Normal profile startup validates links through depth 4 and validates all shared
+state links. Full recursive profile-link validation is performed by profile
+creation/import, backups, and `doctor`.
 
 Sharing local state means every local OS user/process that can read this bundle
 can read all shared conversations and memories. Keep the entire bundle private.
