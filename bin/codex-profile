@@ -1,0 +1,747 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir() {
+  local source="$1" dir target
+  while [ -L "$source" ]; do
+    dir="$(cd -P "$(dirname "$source")" >/dev/null 2>&1 && pwd)"
+    target="$(readlink "$source")"
+    case "$target" in
+      /*) source="$target" ;;
+      *) source="$dir/$target" ;;
+    esac
+  done
+  cd -P "$(dirname "$source")" >/dev/null 2>&1 && pwd
+}
+
+BIN_DIR="$(script_dir "${BASH_SOURCE[0]}")"
+BUNDLE_ROOT="${CODEX_BUNDLE_ROOT:-$(cd "$BIN_DIR/.." >/dev/null 2>&1 && pwd)}"
+PROFILES_ROOT="${CODEX_PROFILES_ROOT:-$BUNDLE_ROOT/profiles}"
+ACTIVE_LINK="${CODEX_ACTIVE_PROFILE_LINK:-$PROFILES_ROOT/current}"
+RUNTIME_ROOT="$BUNDLE_ROOT/runtime/codex"
+RUNTIME_CURRENT="$RUNTIME_ROOT/current"
+SHARED_CODEX_ROOT="${CODEX_SHARED_ROOT:-$BUNDLE_ROOT/shared/codex}"
+DEFAULT_TZ="JST-9"
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  codex-profile list
+  codex-profile current
+  codex-profile paths
+  codex-profile init <name>
+  codex-profile import <name> <codex-home>
+  codex-profile switch <name>
+  codex-profile run [name] [-- <codex-args>...]
+  codex-profile resume [name] [-- <codex-resume-args>...]
+  codex-profile backup [name] [backup.tar.gz]
+  codex-profile doctor
+
+Environment:
+  CODEX_BUNDLE_ROOT              override bundle root; default is parent of bin/
+  CODEX_PROFILES_ROOT            default: $CODEX_BUNDLE_ROOT/profiles
+  CODEX_ACTIVE_PROFILE_LINK      default: $CODEX_PROFILES_ROOT/current
+  CODEX_SHARED_ROOT              default: $CODEX_BUNDLE_ROOT/shared/codex
+  CODEX_REAL_BIN                 optional Codex launcher path; must stay in bundle unless allowed
+  CODEX_TZ                       default: JST-9
+  CODEX_ALLOW_PROXY=1            allow proxy environment variables
+  CODEX_ALLOW_EXTERNAL_RUNTIME=1 allow CODEX_REAL_BIN outside this bundle
+  CODEX_ALLOW_ENV_OVERRIDES=1    allow OpenAI/provider/auth environment overrides
+
+Model:
+  Account credentials and config stay per profile. Sessions, history, explicit
+  Codex memories, goals, thread state, logs, and shell snapshots are linked to
+  shared/codex so every account sees the same local memory and resume state.
+  Use `--` before a prompt or session id that could be mistaken for a profile.
+USAGE
+}
+
+die() {
+  echo "codex-profile: $*" >&2
+  exit 1
+}
+
+note() {
+  echo "codex-profile: $*" >&2
+}
+
+resolve_path() {
+  local path="$1"
+  if command -v realpath >/dev/null 2>&1; then
+    realpath -m "$path"
+  else
+    readlink -f "$path"
+  fi
+}
+
+path_under() {
+  local child root
+  child="$(resolve_path "$1")"
+  root="$(resolve_path "$2")"
+  case "$child" in
+    "$root"|"$root"/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+relative_to_dir() {
+  local from_dir="$1" target="$2"
+  if realpath --relative-to="$from_dir" "$target" >/dev/null 2>&1; then
+    realpath --relative-to="$from_dir" "$target"
+  else
+    printf '%s\n' "$target"
+  fi
+}
+
+ensure_root() {
+  mkdir -p "$PROFILES_ROOT/default" "$BUNDLE_ROOT/backups" \
+    "$RUNTIME_ROOT/versions" "$SHARED_CODEX_ROOT"
+  chmod 700 "$BUNDLE_ROOT" "$BIN_DIR" "$PROFILES_ROOT" \
+    "$PROFILES_ROOT/default" "$BUNDLE_ROOT/backups" "$BUNDLE_ROOT/runtime" \
+    "$RUNTIME_ROOT" "$RUNTIME_ROOT/versions" "$BUNDLE_ROOT/shared" \
+    "$SHARED_CODEX_ROOT" 2>/dev/null || true
+  if [ ! -e "$ACTIVE_LINK" ] && [ ! -L "$ACTIVE_LINK" ]; then
+    (cd "$PROFILES_ROOT" && ln -sfn default current)
+  fi
+}
+
+runtime_version_dir() {
+  local target
+  [ -L "$RUNTIME_CURRENT" ] || die "runtime current link is missing: $RUNTIME_CURRENT"
+  target="$(resolve_path "$RUNTIME_CURRENT")"
+  path_under "$target" "$RUNTIME_ROOT/versions" || die "runtime link escapes runtime root: $target"
+  dirname "$(dirname "$target")"
+}
+
+ensure_runtime_available() {
+  local version_dir parts_dir part_manifest archive_sha tmp_archive tmp_dir expected actual
+  [ -x "$RUNTIME_CURRENT" ] && return 0
+
+  version_dir="$(runtime_version_dir)"
+  parts_dir="$version_dir.parts"
+  [ -d "$parts_dir" ] || return 0
+  part_manifest="$parts_dir/MANIFEST.sha256"
+
+  if [ -f "$part_manifest" ] && command -v sha256sum >/dev/null 2>&1; then
+    (cd "$parts_dir" && sha256sum -c MANIFEST.sha256 >/dev/null)
+  fi
+  compgen -G "$parts_dir/part-*" >/dev/null || \
+    die "runtime is missing and no parts were found under $parts_dir"
+  [ ! -e "$version_dir" ] || \
+    die "runtime directory exists but is incomplete: $version_dir"
+
+  tmp_archive="$RUNTIME_ROOT/versions/.codex-runtime.$$.tar.gz"
+  tmp_dir="$version_dir.tmp.$$"
+  rm -f "$tmp_archive"
+  rm -rf "$tmp_dir"
+  cat "$parts_dir"/part-* > "$tmp_archive"
+
+  archive_sha="$parts_dir/runtime.tar.gz.sha256"
+  if [ -f "$archive_sha" ] && command -v sha256sum >/dev/null 2>&1; then
+    expected="$(awk '{print $1}' "$archive_sha")"
+    actual="$(sha256sum "$tmp_archive" | awk '{print $1}')"
+    if [ "$expected" != "$actual" ]; then
+      rm -f "$tmp_archive"
+      die "reassembled Codex runtime archive hash mismatch"
+    fi
+  fi
+
+  mkdir -p "$tmp_dir"
+  tar -xzf "$tmp_archive" -C "$tmp_dir"
+  rm -f "$tmp_archive"
+  if [ -f "$tmp_dir/MANIFEST.sha256" ] && command -v sha256sum >/dev/null 2>&1; then
+    (cd "$tmp_dir" && sha256sum -c MANIFEST.sha256 >/dev/null) || {
+      rm -rf "$tmp_dir"
+      die "extracted Codex runtime hash mismatch"
+    }
+  fi
+  chmod -R go-rwx "$tmp_dir" 2>/dev/null || true
+  chmod 700 "$tmp_dir/bin/codex" "$tmp_dir/bin/codex-code-mode-host" \
+    "$tmp_dir/codex-path/rg" "$tmp_dir/codex-resources/bwrap" \
+    "$tmp_dir/codex-resources/zsh/bin/zsh" 2>/dev/null || true
+  mv "$tmp_dir" "$version_dir"
+}
+
+valid_name() {
+  case "${1:-}" in
+    ""|*/*|.*|*..*) return 1 ;;
+  esac
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]
+}
+
+require_name() {
+  local name="${1:-}"
+  valid_name "$name" || die "invalid profile name: ${name:-<empty>}"
+}
+
+profile_entry() {
+  printf '%s/%s\n' "$PROFILES_ROOT" "$1"
+}
+
+profile_home() {
+  local name="$1" entry resolved
+  require_name "$name"
+  entry="$(profile_entry "$name")"
+  [ -d "$entry" ] || die "unknown profile: $name"
+  resolved="$(resolve_path "$entry")"
+  path_under "$resolved" "$PROFILES_ROOT" || \
+    die "profile escapes profiles root: $name -> $resolved"
+  printf '%s\n' "$resolved"
+}
+
+active_home() {
+  local resolved
+  [ -e "$ACTIVE_LINK" ] || die "no active profile; run: codex-profile switch <name>"
+  resolved="$(resolve_path "$ACTIVE_LINK")"
+  [ -d "$resolved" ] || die "active profile is not a directory: $resolved"
+  path_under "$resolved" "$PROFILES_ROOT" || die "active profile escapes profiles root: $resolved"
+  printf '%s\n' "$resolved"
+}
+
+active_name() {
+  local active entry name
+  [ -e "$ACTIVE_LINK" ] || return 1
+  active="$(active_home)"
+  find "$PROFILES_ROOT" -mindepth 1 -maxdepth 1 -type d -print 2>/dev/null |
+    while IFS= read -r entry; do
+      name="$(basename "$entry")"
+      [ "$(resolve_path "$entry")" = "$active" ] && printf '%s\n' "$name" && break
+    done
+}
+
+secure_profile_perms() {
+  local home="$1"
+  [ -d "$home" ] || return 0
+  chmod 700 "$home" 2>/dev/null || true
+  find "$home" -xdev -type d -exec chmod 700 {} + 2>/dev/null || true
+  find "$home" -xdev -type f -exec chmod go-rwx {} + 2>/dev/null || true
+}
+
+ensure_profile_scaffold() {
+  local home="$1"
+  mkdir -p "$home/.codex" "$home/.config" "$home/.cache" \
+    "$home/.local/share" "$home/.local/bin"
+  chmod 700 "$home" "$home/.codex" "$home/.config" "$home/.cache" \
+    "$home/.local" "$home/.local/share" "$home/.local/bin" 2>/dev/null || true
+  [ -f "$home/.codex/auth.json" ] && chmod 600 "$home/.codex/auth.json" 2>/dev/null || true
+  [ -f "$home/.codex/config.toml" ] && chmod 600 "$home/.codex/config.toml" 2>/dev/null || true
+}
+
+ensure_shared_state() {
+  local name
+  mkdir -p "$SHARED_CODEX_ROOT"
+  for name in sessions archived_sessions shell_snapshots; do
+    mkdir -p "$SHARED_CODEX_ROOT/$name"
+  done
+  touch "$SHARED_CODEX_ROOT/history.jsonl"
+  chmod 700 "$BUNDLE_ROOT/shared" "$SHARED_CODEX_ROOT" \
+    "$SHARED_CODEX_ROOT/sessions" "$SHARED_CODEX_ROOT/archived_sessions" \
+    "$SHARED_CODEX_ROOT/shell_snapshots" 2>/dev/null || true
+  chmod 600 "$SHARED_CODEX_ROOT/history.jsonl" 2>/dev/null || true
+}
+
+link_shared_dir() {
+  local codex_home="$1" name="$2" profile_path target rel
+  profile_path="$codex_home/$name"
+  target="$SHARED_CODEX_ROOT/$name"
+  mkdir -p "$target"
+
+  if [ -L "$profile_path" ]; then
+    path_under "$(resolve_path "$profile_path")" "$SHARED_CODEX_ROOT" && return 0
+    die "refusing to replace external symlink: $profile_path -> $(resolve_path "$profile_path")"
+  fi
+  if [ -e "$profile_path" ]; then
+    [ -d "$profile_path" ] || die "cannot share non-directory path: $profile_path"
+    if find "$profile_path" -mindepth 1 -print -quit 2>/dev/null | grep -q .; then
+      if command -v rsync >/dev/null 2>&1; then
+        rsync -a "$profile_path"/ "$target"/
+      else
+        (cd "$profile_path" && tar -cf - .) | (cd "$target" && tar -xf -)
+      fi
+    fi
+    rm -rf "$profile_path"
+  fi
+  rel="$(relative_to_dir "$(dirname "$profile_path")" "$target")"
+  ln -sfn "$rel" "$profile_path"
+}
+
+link_shared_history() {
+  local codex_home="$1" profile_path target rel
+  profile_path="$codex_home/history.jsonl"
+  target="$SHARED_CODEX_ROOT/history.jsonl"
+  touch "$target"
+
+  if [ -L "$profile_path" ]; then
+    path_under "$(resolve_path "$profile_path")" "$SHARED_CODEX_ROOT" && return 0
+    die "refusing to replace external symlink: $profile_path -> $(resolve_path "$profile_path")"
+  fi
+  if [ -e "$profile_path" ]; then
+    [ -f "$profile_path" ] || die "cannot share non-file path: $profile_path"
+    [ ! -s "$profile_path" ] || cat "$profile_path" >> "$target"
+    rm -f "$profile_path"
+  fi
+  rel="$(relative_to_dir "$(dirname "$profile_path")" "$target")"
+  ln -sfn "$rel" "$profile_path"
+  chmod 600 "$target" 2>/dev/null || true
+}
+
+is_shared_database_name() {
+  [[ "$1" =~ ^(state|memories|goals|logs)_[0-9]+\.sqlite$ ]]
+}
+
+link_shared_database() {
+  local codex_home="$1" name="$2" profile_path target rel suffix
+  is_shared_database_name "$name" || die "refusing unknown shared database name: $name"
+  profile_path="$codex_home/$name"
+  target="$SHARED_CODEX_ROOT/$name"
+
+  if [ -L "$profile_path" ]; then
+    path_under "$(resolve_path "$profile_path")" "$SHARED_CODEX_ROOT" && return 0
+    die "refusing to replace external symlink: $profile_path -> $(resolve_path "$profile_path")"
+  fi
+  if [ -e "$profile_path" ]; then
+    [ -f "$profile_path" ] || die "cannot share non-file database: $profile_path"
+    if [ -e "$target" ]; then
+      if [ ! -s "$target" ]; then
+        [ ! -s "$target-wal" ] && [ ! -s "$target-shm" ] || \
+          die "shared database journal is active for $name; stop all bundle Codex processes before import"
+        rm -f "$target" "$target-wal" "$target-shm"
+        mv "$profile_path" "$target"
+        for suffix in -wal -shm; do
+          [ ! -e "$profile_path$suffix" ] || mv "$profile_path$suffix" "$target$suffix"
+        done
+      elif command -v cmp >/dev/null 2>&1 && cmp -s "$profile_path" "$target"; then
+        [ ! -e "$profile_path-wal" ] && [ ! -e "$profile_path-shm" ] || \
+          die "database journal conflict for $name; stop Codex and checkpoint $profile_path before import"
+        rm -f "$profile_path"
+      else
+        die "database conflict for $name; keep Codex stopped and resolve $profile_path versus $target"
+      fi
+    else
+      mv "$profile_path" "$target"
+      for suffix in -wal -shm; do
+        [ ! -e "$profile_path$suffix" ] || mv "$profile_path$suffix" "$target$suffix"
+      done
+    fi
+  fi
+  [ -e "$target" ] || touch "$target"
+  rel="$(relative_to_dir "$(dirname "$profile_path")" "$target")"
+  ln -sfn "$rel" "$profile_path"
+  chmod 600 "$target" 2>/dev/null || true
+}
+
+ensure_shared_databases() {
+  local codex_home="$1" path name
+  for path in "$codex_home"/state_*.sqlite "$codex_home"/memories_*.sqlite \
+    "$codex_home"/goals_*.sqlite "$codex_home"/logs_*.sqlite; do
+    [ -e "$path" ] || continue
+    name="$(basename "$path")"
+    link_shared_database "$codex_home" "$name"
+  done
+
+  for name in state_5.sqlite memories_1.sqlite goals_1.sqlite logs_2.sqlite; do
+    link_shared_database "$codex_home" "$name"
+  done
+
+  for path in "$SHARED_CODEX_ROOT"/state_*.sqlite "$SHARED_CODEX_ROOT"/memories_*.sqlite \
+    "$SHARED_CODEX_ROOT"/goals_*.sqlite "$SHARED_CODEX_ROOT"/logs_*.sqlite; do
+    [ -e "$path" ] || continue
+    name="$(basename "$path")"
+    link_shared_database "$codex_home" "$name"
+  done
+}
+
+ensure_shared_memory() {
+  local home="$1" codex_home name
+  codex_home="$home/.codex"
+  ensure_profile_scaffold "$home"
+  ensure_shared_state
+  for name in sessions archived_sessions shell_snapshots; do
+    link_shared_dir "$codex_home" "$name"
+  done
+  link_shared_history "$codex_home"
+  ensure_shared_databases "$codex_home"
+}
+
+ensure_profile_launcher() {
+  local home="$1" link link_dir rel
+  link="$home/.local/bin/codex"
+  link_dir="$(dirname "$link")"
+  mkdir -p "$link_dir"
+  ensure_runtime_available
+  [ -x "$RUNTIME_CURRENT" ] || die "bundled Codex runtime is missing: $RUNTIME_CURRENT"
+  rel="$(relative_to_dir "$link_dir" "$RUNTIME_CURRENT")"
+  ln -sfn "$rel" "$link"
+  chmod 700 "$link_dir" 2>/dev/null || true
+}
+
+profile_symlink_target_allowed() {
+  local root="$1" link="$2" target="$3" rel name
+  if [ "$link" = "$root/.local/bin/codex" ] && path_under "$target" "$RUNTIME_ROOT"; then
+    return 0
+  fi
+  rel="${link#$root/.codex/}"
+  case "$rel" in
+    sessions|archived_sessions|shell_snapshots|history.jsonl)
+      path_under "$target" "$SHARED_CODEX_ROOT" && return 0
+      ;;
+    *.sqlite)
+      name="$(basename "$rel")"
+      is_shared_database_name "$name" && path_under "$target" "$SHARED_CODEX_ROOT" && return 0
+      ;;
+  esac
+  path_under "$target" "$root"
+}
+
+check_escaping_symlinks() {
+  local root="$1" maxdepth="${2:-}" link target ok=0
+  root="$(resolve_path "$root")"
+  if [ -n "$maxdepth" ]; then
+    while IFS= read -r link; do
+      target="$(resolve_path "$link")"
+      if ! profile_symlink_target_allowed "$root" "$link" "$target"; then
+        echo "escaping symlink: $link -> $target" >&2
+        ok=1
+      fi
+    done < <(find "$root" -xdev -maxdepth "$maxdepth" -type l -print 2>/dev/null)
+  else
+    while IFS= read -r link; do
+      target="$(resolve_path "$link")"
+      if ! profile_symlink_target_allowed "$root" "$link" "$target"; then
+        echo "escaping symlink: $link -> $target" >&2
+        ok=1
+      fi
+    done < <(find "$root" -xdev -type l -print 2>/dev/null)
+  fi
+  return "$ok"
+}
+
+reject_escaping_symlinks() {
+  check_escaping_symlinks "$1" || die "profile contains symlinks that point outside allowed roots"
+}
+
+reject_shared_symlinks() {
+  local link target ok=0
+  while IFS= read -r link; do
+    target="$(resolve_path "$link")"
+    if ! path_under "$target" "$SHARED_CODEX_ROOT"; then
+      echo "escaping shared symlink: $link -> $target" >&2
+      ok=1
+    fi
+  done < <(find "$SHARED_CODEX_ROOT" -xdev -type l -print 2>/dev/null)
+  [ "$ok" -eq 0 ] || die "shared Codex state contains escaping symlinks"
+}
+
+proxy_env_lines() {
+  env | awk -F= '{
+    name=$1; lname=tolower(name)
+    if (lname ~ /^(http_proxy|https_proxy|all_proxy|no_proxy|proxy)$/ || lname ~ /(^|_)(http_proxy|https_proxy|all_proxy|no_proxy)$/) print name"="substr($0, length($1)+2)
+  }'
+}
+
+override_env_lines() {
+  env | awk -F= '{
+    name=$1; uname=toupper(name)
+    if (uname ~ /^CODEX_(BUNDLE_ROOT|PROFILES_ROOT|ACTIVE_PROFILE_LINK|SHARED_ROOT|REAL_BIN|TZ|ALLOW_PROXY|ALLOW_EXTERNAL_RUNTIME|ALLOW_ENV_OVERRIDES)$/) next
+    if (uname ~ /^(OPENAI_|CODEX_|AZURE_OPENAI_|AZURE_|AWS_|GOOGLE_APPLICATION_CREDENTIALS$|GOOGLE_CLOUD_)/) print name"=<set>"
+  }'
+}
+
+require_safe_env() {
+  if [ "${CODEX_ALLOW_PROXY:-0}" != "1" ] && proxy_env_lines | grep -q .; then
+    proxy_env_lines | sed -E 's#://[^:@/]+:[^@/]+@#://<redacted>@#' >&2
+    die "proxy environment variables detected; unset them or set CODEX_ALLOW_PROXY=1 explicitly"
+  fi
+  if [ "${CODEX_ALLOW_ENV_OVERRIDES:-0}" != "1" ] && override_env_lines | grep -q .; then
+    override_env_lines >&2
+    die "OpenAI/Codex/provider environment overrides detected; unset them or set CODEX_ALLOW_ENV_OVERRIDES=1 explicitly"
+  fi
+}
+
+resolve_launcher() {
+  local candidate
+  ensure_runtime_available
+  if [ -n "${CODEX_REAL_BIN:-}" ]; then
+    [ -x "$CODEX_REAL_BIN" ] || die "CODEX_REAL_BIN is not executable: $CODEX_REAL_BIN"
+    candidate="$(resolve_path "$CODEX_REAL_BIN")"
+    if ! path_under "$candidate" "$RUNTIME_ROOT" && [ "${CODEX_ALLOW_EXTERNAL_RUNTIME:-0}" != "1" ]; then
+      die "CODEX_REAL_BIN points outside this bundle: $candidate"
+    fi
+    printf '%s\n' "$candidate"
+    return
+  fi
+  [ -x "$RUNTIME_CURRENT" ] || die "cannot find bundled Codex runtime under $RUNTIME_ROOT"
+  candidate="$(resolve_path "$RUNTIME_CURRENT")"
+  path_under "$candidate" "$RUNTIME_ROOT" || die "bundled runtime escapes runtime root: $candidate"
+  printf '%s\n' "$candidate"
+}
+
+init_profile() {
+  local name="$1" home
+  require_name "$name"
+  ensure_root
+  home="$(profile_entry "$name")"
+  [ ! -e "$home" ] || die "profile already exists: $name"
+  ensure_profile_scaffold "$home"
+  ensure_shared_memory "$home"
+  ensure_profile_launcher "$home"
+  secure_profile_perms "$home"
+  note "created empty profile: $name"
+  note "start it with: $BIN_DIR/codex-profile run $name"
+}
+
+import_profile() {
+  local name="$1" src="$2" home
+  require_name "$name"
+  [ -d "$src" ] || die "source CODEX_HOME is not a directory: $src"
+  ensure_root
+  home="$(profile_entry "$name")"
+  [ ! -e "$home" ] || die "profile already exists: $name"
+  ensure_profile_scaffold "$home"
+
+  if command -v rsync >/dev/null 2>&1; then
+    rsync -a "$src"/ "$home/.codex"/
+  else
+    (cd "$src" && tar -cf - .) | (cd "$home/.codex" && tar -xf -)
+  fi
+  ensure_shared_memory "$home"
+  ensure_profile_launcher "$home"
+  reject_escaping_symlinks "$home"
+  reject_shared_symlinks
+  secure_profile_perms "$home"
+  note "imported $name into $home"
+}
+
+switch_profile() {
+  local name="$1"
+  profile_home "$name" >/dev/null
+  ensure_root
+  (cd "$PROFILES_ROOT" && ln -sfn "$name" current)
+  note "active profile: $name"
+  note "home: $(profile_home "$name")"
+}
+
+run_codex() {
+  local home="$1" launcher tz
+  shift
+  launcher="$(resolve_launcher)"
+  tz="${CODEX_TZ:-$DEFAULT_TZ}"
+  require_safe_env
+  ensure_profile_scaffold "$home"
+  ensure_shared_memory "$home"
+  ensure_profile_launcher "$home"
+  check_escaping_symlinks "$home" 4 || die "profile contains disallowed top-level symlinks"
+  reject_shared_symlinks
+
+  export HOME="$home"
+  export CODEX_HOME="$home/.codex"
+  export XDG_CONFIG_HOME="$home/.config"
+  export XDG_CACHE_HOME="$home/.cache"
+  export XDG_DATA_HOME="$home/.local/share"
+  export TZ="$tz"
+  export PATH="$BIN_DIR:$home/.local/bin:$PATH"
+  exec "$launcher" "$@"
+}
+
+run_profile() {
+  local name="${1:-}" home
+  if [ -n "$name" ] && [ "$name" != "--" ]; then
+    shift
+    home="$(profile_home "$name")"
+  else
+    [ "${1:-}" = "--" ] && shift
+    home="$(active_home)"
+  fi
+  [ "${1:-}" = "--" ] && shift
+  run_codex "$home" "$@"
+}
+
+resume_profile() {
+  local name="${1:-}"
+  if [ -n "$name" ] && [ "$name" != "--" ]; then
+    shift
+    [ "${1:-}" = "--" ] && shift
+    run_profile "$name" -- resume "$@"
+  else
+    [ "${1:-}" = "--" ] && shift
+    run_profile -- resume "$@"
+  fi
+}
+
+list_profiles() {
+  local active="" entry name marker target
+  ensure_root
+  [ -e "$ACTIVE_LINK" ] && active="$(active_home)"
+  echo "Profiles root: $PROFILES_ROOT"
+  find "$PROFILES_ROOT" -mindepth 1 -maxdepth 1 -type d -print 2>/dev/null |
+    sort |
+    while IFS= read -r entry; do
+      name="$(basename "$entry")"
+      target="$(profile_home "$name")"
+      marker=" "
+      [ -n "$active" ] && [ "$target" = "$active" ] && marker="*"
+      printf '%s %-24s %s\n' "$marker" "$name" "$target"
+    done
+}
+
+show_current() {
+  local name
+  [ -e "$ACTIVE_LINK" ] || die "no active profile"
+  name="$(active_name || true)"
+  [ -n "$name" ] && printf '%s\n' "$name" || active_home
+}
+
+show_paths() {
+  echo "CODEX_BUNDLE_ROOT=$BUNDLE_ROOT"
+  echo "CODEX_PROFILES_ROOT=$PROFILES_ROOT"
+  echo "CODEX_ACTIVE_PROFILE_LINK=$ACTIVE_LINK"
+  echo "CODEX_SHARED_ROOT=$SHARED_CODEX_ROOT"
+  echo "CODEX_REAL_BIN=$(resolve_launcher)"
+  echo "CODEX_TZ=${CODEX_TZ:-$DEFAULT_TZ}"
+}
+
+backup_profile() {
+  local name="${1:-}" dest="${2:-}" home stamp
+  if [ -n "$name" ] && [ "$name" != "--" ]; then
+    home="$(profile_home "$name")"
+  else
+    home="$(active_home)"
+    name="$(active_name || basename "$home")"
+  fi
+  reject_escaping_symlinks "$home"
+  stamp="$(date +%Y%m%d-%H%M%S)"
+  if [ -z "$dest" ]; then
+    mkdir -p "$BUNDLE_ROOT/backups"
+    chmod 700 "$BUNDLE_ROOT/backups" 2>/dev/null || true
+    dest="$BUNDLE_ROOT/backups/$name-$stamp.tar.gz"
+  fi
+  tar -C "$home" -czf "$dest" .
+  chmod 600 "$dest" 2>/dev/null || true
+  note "backup written: $dest"
+  note "backup contains profile credentials; shared memory stays under $SHARED_CODEX_ROOT"
+}
+
+doctor() {
+  local ok=1 launcher tz proxy_count override_count active runtime_link active_link version_dir
+  ensure_root
+  tz="${CODEX_TZ:-$DEFAULT_TZ}"
+  echo "Bundle root:    $BUNDLE_ROOT"
+  echo "Bin dir:        $BIN_DIR"
+  echo "Profiles root:  $PROFILES_ROOT"
+  echo "Shared root:    $SHARED_CODEX_ROOT"
+  echo "Active link:    $ACTIVE_LINK"
+  echo "Profile count:  $(find "$PROFILES_ROOT" -mindepth 1 -maxdepth 1 -type d -print 2>/dev/null | wc -l | awk '{print $1}')"
+
+  if [ -e "$ACTIVE_LINK" ]; then
+    if active="$(active_home 2>/dev/null)"; then
+      echo "Active home:    $active"
+      echo "Active name:    $(active_name || true)"
+      ensure_profile_scaffold "$active"
+      ensure_shared_memory "$active"
+      ensure_profile_launcher "$active"
+      if check_escaping_symlinks "$active" 4; then
+        echo "Profile links:  contained/shared at depth<=4"
+      else
+        echo "Profile links:  escaping symlink detected"
+        ok=0
+      fi
+      if [ -L "$active/.codex/memories_1.sqlite" ] && \
+        path_under "$(resolve_path "$active/.codex/memories_1.sqlite")" "$SHARED_CODEX_ROOT"; then
+        echo "Shared memory:  memories_1.sqlite linked"
+      else
+        echo "Shared memory:  missing or not linked"
+        ok=0
+      fi
+    else
+      echo "Active home:    invalid"
+      ok=0
+    fi
+  else
+    echo "Active home:    <none>"
+    ok=0
+  fi
+
+  if launcher="$(resolve_launcher 2>/dev/null)"; then
+    echo "Launcher:       $launcher"
+    version_dir="$(dirname "$(dirname "$launcher")")"
+    if [ -f "$version_dir/MANIFEST.sha256" ] && command -v sha256sum >/dev/null 2>&1; then
+      if (cd "$version_dir" && sha256sum -c MANIFEST.sha256 >/dev/null); then
+        echo "Runtime hash:   ok"
+      else
+        echo "Runtime hash:   mismatch"
+        ok=0
+      fi
+    else
+      echo "Runtime hash:   not recorded"
+      ok=0
+    fi
+    echo "Codex version:  $("$launcher" --version 2>/dev/null || echo unknown)"
+  else
+    echo "Launcher:       <missing or unsafe>"
+    ok=0
+  fi
+
+  if [ -L "$RUNTIME_CURRENT" ]; then
+    runtime_link="$(readlink "$RUNTIME_CURRENT")"
+    case "$runtime_link" in
+      /*) echo "Runtime link:   absolute ($runtime_link)"; ok=0 ;;
+      *) echo "Runtime link:   relative ($runtime_link)" ;;
+    esac
+  else
+    echo "Runtime link:   <not a symlink>"
+    ok=0
+  fi
+  if [ -L "$ACTIVE_LINK" ]; then
+    active_link="$(readlink "$ACTIVE_LINK")"
+    case "$active_link" in
+      /*) echo "Active link:    absolute target ($active_link)"; ok=0 ;;
+      *) echo "Active link:    relative target ($active_link)" ;;
+    esac
+  fi
+
+  proxy_count="$(proxy_env_lines | wc -l | awk '{print $1}')"
+  if [ "$proxy_count" = 0 ]; then
+    echo "Proxy env:      none"
+  elif [ "${CODEX_ALLOW_PROXY:-0}" = 1 ]; then
+    echo "Proxy env:      detected, explicitly allowed"
+  else
+    echo "Proxy env:      detected, run will refuse unless CODEX_ALLOW_PROXY=1"
+    ok=0
+  fi
+  override_count="$(override_env_lines | wc -l | awk '{print $1}')"
+  if [ "$override_count" = 0 ]; then
+    echo "Env overrides:  none"
+  elif [ "${CODEX_ALLOW_ENV_OVERRIDES:-0}" = 1 ]; then
+    echo "Env overrides:  detected, explicitly allowed"
+  else
+    echo "Env overrides:  detected, run will refuse unless CODEX_ALLOW_ENV_OVERRIDES=1"
+    ok=0
+  fi
+
+  echo "Codex TZ:       $tz ($(TZ="$tz" date '+%Z %z' 2>/dev/null || echo unknown))"
+  echo "Root perms:     $(stat -c '%a' "$BUNDLE_ROOT" 2>/dev/null || echo unknown)"
+  echo "Profile perms:  $(stat -c '%a' "$PROFILES_ROOT" 2>/dev/null || echo unknown)"
+  [ "$ok" -eq 1 ] || exit 1
+}
+
+main() {
+  local cmd="${1:-help}"
+  [ $# -gt 0 ] && shift || true
+  case "$cmd" in
+    help|-h|--help) usage ;;
+    list|ls) list_profiles ;;
+    current) show_current ;;
+    paths) show_paths ;;
+    init) [ $# -eq 1 ] || die "usage: codex-profile init <name>"; init_profile "$1" ;;
+    import) [ $# -eq 2 ] || die "usage: codex-profile import <name> <codex-home>"; import_profile "$1" "$2" ;;
+    switch|use) [ $# -eq 1 ] || die "usage: codex-profile switch <name>"; switch_profile "$1" ;;
+    run) run_profile "$@" ;;
+    run-current) run_profile -- "$@" ;;
+    resume) resume_profile "$@" ;;
+    backup) backup_profile "$@" ;;
+    doctor|health) doctor ;;
+    *) die "unknown command: $cmd" ;;
+  esac
+}
+
+main "$@"

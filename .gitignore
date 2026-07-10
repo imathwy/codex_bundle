@@ -1,0 +1,21 @@
+# Local account profiles and active-profile link.
+profiles/*
+!profiles/.keep
+!profiles/default/
+profiles/default/**
+!profiles/default/.keep
+
+# Shared Codex conversations, memories, and SQLite state.
+shared/codex/**
+!shared/codex/.keep
+
+# Credential-bearing backups.
+backups/*
+!backups/.keep
+
+# Reassembled runtime; keep only split archives.
+runtime/codex/versions/*
+!runtime/codex/versions/*.parts/
+!runtime/codex/versions/*.parts/**
+runtime/codex/versions/*.tmp.*
+runtime/codex/versions/.codex-runtime.*
