@@ -42,6 +42,13 @@ Switch the default account and resume shared sessions:
 ./bin/codex-profile resume -- <session-id>
 ```
 
+## Lean LSP MCP
+
+Every profile automatically registers the `lean-lsp` stdio MCP server with
+`command = "uvx"` and `args = ["lean-lsp-mcp"]`. New profiles receive the same
+entry on first initialization. The `uvx` executable is a host prerequisite; run
+`uvx --version` before starting Codex and install `uv` if it is missing.
+
 ## Shared memory model
 
 Each profile has an isolated `HOME` and `CODEX_HOME`:
