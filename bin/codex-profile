@@ -566,7 +566,7 @@ switch_profile() {
 }
 
 run_codex() {
-  local home="$1" launcher tz
+  local home="$1" launcher tz host_home="${HOME:-}"
   shift
   launcher="$(resolve_launcher)"
   tz="${CODEX_TZ:-$DEFAULT_TZ}"
@@ -582,7 +582,7 @@ run_codex() {
   export XDG_CACHE_HOME="$home/.cache"
   export XDG_DATA_HOME="$home/.local/share"
   export TZ="$tz"
-  export PATH="$BIN_DIR:$home/.local/bin:$PATH"
+  export PATH="$BIN_DIR:$home/.local/bin:${host_home:+$host_home/.local/bin:}$PATH"
   exec "$launcher" "$@"
 }
 
