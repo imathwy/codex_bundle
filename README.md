@@ -54,6 +54,11 @@ When Codex starts inside a Lean/Lake project, the launcher refreshes an existing
 prevents imported or recovery-generated profile configs from retaining deleted
 temporary project paths while still allowing one profile to work across repos.
 
+For fast startup, `run` validates profile links only through depth 4, together
+with all shared-state links. Full recursive profile-link validation remains
+mandatory for `init`, `import`, `backup`, and `doctor`; run `doctor` after a
+manual profile migration or whenever a full security audit is desired.
+
 ## Shared memory model
 
 Each profile has an isolated `HOME` and `CODEX_HOME`:

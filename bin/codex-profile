@@ -84,6 +84,14 @@ path_under() {
   esac
 }
 
+path_under_resolved() {
+  local child="$1" root="$2"
+  case "$child" in
+    "$root"|"$root"/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 relative_to_dir() {
   local from_dir="$1" target="$2"
   if realpath --relative-to="$from_dir" "$target" >/dev/null 2>&1; then
@@ -308,12 +316,13 @@ ensure_shared_state() {
 }
 
 link_shared_dir() {
-  local codex_home="$1" name="$2" profile_path target rel
+  local codex_home="$1" name="$2" mode="${3:-full}" profile_path target rel
   profile_path="$codex_home/$name"
   target="$SHARED_CODEX_ROOT/$name"
   mkdir -p "$target"
 
   if [ -L "$profile_path" ]; then
+    [ "$mode" = fast ] && return 0
     path_under "$(resolve_path "$profile_path")" "$SHARED_CODEX_ROOT" && return 0
     die "refusing to replace external symlink: $profile_path -> $(resolve_path "$profile_path")"
   fi
@@ -333,12 +342,13 @@ link_shared_dir() {
 }
 
 link_shared_history() {
-  local codex_home="$1" profile_path target rel
+  local codex_home="$1" mode="${2:-full}" profile_path target rel
   profile_path="$codex_home/history.jsonl"
   target="$SHARED_CODEX_ROOT/history.jsonl"
   touch "$target"
 
   if [ -L "$profile_path" ]; then
+    [ "$mode" = fast ] && return 0
     path_under "$(resolve_path "$profile_path")" "$SHARED_CODEX_ROOT" && return 0
     die "refusing to replace external symlink: $profile_path -> $(resolve_path "$profile_path")"
   fi
@@ -357,12 +367,13 @@ is_shared_database_name() {
 }
 
 link_shared_database() {
-  local codex_home="$1" name="$2" profile_path target rel suffix
+  local codex_home="$1" name="$2" mode="${3:-full}" profile_path target rel suffix
   is_shared_database_name "$name" || die "refusing unknown shared database name: $name"
   profile_path="$codex_home/$name"
   target="$SHARED_CODEX_ROOT/$name"
 
   if [ -L "$profile_path" ]; then
+    [ "$mode" = fast ] && return 0
     path_under "$(resolve_path "$profile_path")" "$SHARED_CODEX_ROOT" && return 0
     die "refusing to replace external symlink: $profile_path -> $(resolve_path "$profile_path")"
   fi
@@ -398,39 +409,53 @@ link_shared_database() {
 }
 
 ensure_shared_databases() {
-  local codex_home="$1" path name
+  local codex_home="$1" mode="${2:-full}" path name
+  local -A seen=()
   for path in "$codex_home"/state_*.sqlite "$codex_home"/memories_*.sqlite \
     "$codex_home"/goals_*.sqlite "$codex_home"/logs_*.sqlite; do
     [ -e "$path" ] || continue
-    name="$(basename "$path")"
-    link_shared_database "$codex_home" "$name"
+    name="${path##*/}"
+    [ -z "${seen[$name]+x}" ] || continue
+    seen[$name]=1
+    link_shared_database "$codex_home" "$name" "$mode"
   done
 
   for name in state_5.sqlite memories_1.sqlite goals_1.sqlite logs_2.sqlite; do
-    link_shared_database "$codex_home" "$name"
+    [ -z "${seen[$name]+x}" ] || continue
+    seen[$name]=1
+    link_shared_database "$codex_home" "$name" "$mode"
   done
 
   for path in "$SHARED_CODEX_ROOT"/state_*.sqlite "$SHARED_CODEX_ROOT"/memories_*.sqlite \
     "$SHARED_CODEX_ROOT"/goals_*.sqlite "$SHARED_CODEX_ROOT"/logs_*.sqlite; do
     [ -e "$path" ] || continue
-    name="$(basename "$path")"
-    link_shared_database "$codex_home" "$name"
+    name="${path##*/}"
+    [ -z "${seen[$name]+x}" ] || continue
+    seen[$name]=1
+    link_shared_database "$codex_home" "$name" "$mode"
   done
 }
 
 ensure_shared_memory() {
-  local home="$1" codex_home name
+  local home="$1" mode="${2:-full}" codex_home name
   codex_home="$home/.codex"
-  reject_escaping_symlinks "$home"
+  case "$mode" in
+    full) reject_escaping_symlinks "$home" ;;
+    fast) check_escaping_symlinks "$home" 4 || die "profile contains disallowed top-level symlinks" ;;
+    *) die "unknown shared-memory validation mode: $mode" ;;
+  esac
   reject_shared_symlinks
   ensure_profile_scaffold "$home"
   ensure_shared_state
   for name in sessions archived_sessions shell_snapshots; do
-    link_shared_dir "$codex_home" "$name"
+    link_shared_dir "$codex_home" "$name" "$mode"
   done
-  link_shared_history "$codex_home"
-  ensure_shared_databases "$codex_home"
-  reject_escaping_symlinks "$home"
+  link_shared_history "$codex_home" "$mode"
+  ensure_shared_databases "$codex_home" "$mode"
+  case "$mode" in
+    full) reject_escaping_symlinks "$home" ;;
+    fast) : ;;
+  esac
   reject_shared_symlinks
 }
 
@@ -447,28 +472,28 @@ ensure_profile_launcher() {
 }
 
 profile_symlink_target_allowed() {
-  local root="$1" link="$2" target="$3" rel name
-  if [ "$link" = "$root/.local/bin/codex" ] && path_under "$target" "$RUNTIME_ROOT"; then
+  local root="$1" link="$2" target="$3" runtime_root="$4" shared_root="$5" rel name
+  if [ "$link" = "$root/.local/bin/codex" ] && path_under_resolved "$target" "$runtime_root"; then
     return 0
   fi
   rel="${link#$root/.codex/}"
   case "$rel" in
     tmp/arg0/codex-arg*/apply_patch|tmp/arg0/codex-arg*/applypatch|\
     tmp/arg0/codex-arg*/codex-execve-wrapper|tmp/arg0/codex-arg*/codex-linux-sandbox)
-      path_under "$target" "$RUNTIME_ROOT" && return 0
+      path_under_resolved "$target" "$runtime_root" && return 0
       ;;
     sessions|archived_sessions|shell_snapshots|history.jsonl)
-      path_under "$target" "$SHARED_CODEX_ROOT" && return 0
+      path_under_resolved "$target" "$shared_root" && return 0
       ;;
     *.sqlite)
       name="$(basename "$rel")"
-      is_shared_database_name "$name" && path_under "$target" "$SHARED_CODEX_ROOT" && return 0
+      is_shared_database_name "$name" && path_under_resolved "$target" "$shared_root" && return 0
       ;;
   esac
   if uv_cache_python_link_allowed "$root" "$link" "$target"; then
     return 0
   fi
-  path_under "$target" "$root"
+  path_under_resolved "$target" "$root"
 }
 
 uv_cache_python_link_allowed() {
@@ -503,12 +528,14 @@ uv_cache_python_link_allowed() {
 }
 
 check_escaping_symlinks() {
-  local root="$1" maxdepth="${2:-}" link target ok=0
+  local root="$1" maxdepth="${2:-}" link target runtime_root shared_root ok=0
   root="$(resolve_path "$root")"
+  runtime_root="$(resolve_path "$RUNTIME_ROOT")"
+  shared_root="$(resolve_path "$SHARED_CODEX_ROOT")"
   if [ -n "$maxdepth" ]; then
     while IFS= read -r link; do
       target="$(resolve_path "$link")"
-      if ! profile_symlink_target_allowed "$root" "$link" "$target"; then
+      if ! profile_symlink_target_allowed "$root" "$link" "$target" "$runtime_root" "$shared_root"; then
         echo "escaping symlink: $link -> $target" >&2
         ok=1
       fi
@@ -516,7 +543,7 @@ check_escaping_symlinks() {
   else
     while IFS= read -r link; do
       target="$(resolve_path "$link")"
-      if ! profile_symlink_target_allowed "$root" "$link" "$target"; then
+      if ! profile_symlink_target_allowed "$root" "$link" "$target" "$runtime_root" "$shared_root"; then
         echo "escaping symlink: $link -> $target" >&2
         ok=1
       fi
@@ -652,10 +679,9 @@ run_codex() {
   launcher="$(resolve_launcher)"
   tz="${CODEX_TZ:-$DEFAULT_TZ}"
   require_safe_env
-  ensure_shared_memory "$home"
+  ensure_shared_memory "$home" fast
   ensure_profile_launcher "$home"
   refresh_lean_mcp_project_path "$home" "$PWD"
-  check_escaping_symlinks "$home" 4 || die "profile contains disallowed top-level symlinks"
   reject_shared_symlinks
 
   export HOME="$home"
