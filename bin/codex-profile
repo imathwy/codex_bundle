@@ -418,7 +418,39 @@ profile_symlink_target_allowed() {
       is_shared_database_name "$name" && path_under "$target" "$SHARED_CODEX_ROOT" && return 0
       ;;
   esac
+  if uv_cache_python_link_allowed "$root" "$link" "$target"; then
+    return 0
+  fi
   path_under "$target" "$root"
+}
+
+uv_cache_python_link_allowed() {
+  local root="$1" link="$2" target="$3" rel tail archive name target_dir
+  rel="${link#$root/}"
+  case "$rel" in
+    .cache/uv/archive-v0/*) ;;
+    *) return 1 ;;
+  esac
+
+  tail="${rel#.cache/uv/archive-v0/}"
+  archive="${tail%%/*}"
+  tail="${tail#*/}"
+  [ -n "$archive" ] || return 1
+  case "$tail" in
+    bin/*) ;;
+    *) return 1 ;;
+  esac
+  name="${tail#bin/}"
+  [ "$(basename "$name")" = "$name" ] || return 1
+  [[ "$name" =~ ^python([0-9]+(\.[0-9]+)*)?$ ]] || return 1
+
+  target_dir="$(dirname "$target")"
+  case "$target_dir" in
+    /usr/bin|/usr/local/bin) ;;
+    *) return 1 ;;
+  esac
+  [[ "$(basename "$target")" =~ ^python([0-9]+(\.[0-9]+)*)?$ ]] && \
+    [ -f "$target" ] && [ -x "$target" ]
 }
 
 check_escaping_symlinks() {
