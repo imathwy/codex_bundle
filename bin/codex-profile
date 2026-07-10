@@ -504,6 +504,9 @@ import_profile() {
   else
     (cd "$src" && tar -cf - .) | (cd "$home/.codex" && tar -xf -)
   fi
+  # Reject copied links before scaffold permission fixes or shared-state migration
+  # can follow or replace them. Re-check after installing approved bundle links.
+  reject_escaping_symlinks "$home"
   ensure_shared_memory "$home"
   ensure_profile_launcher "$home"
   reject_escaping_symlinks "$home"
