@@ -236,6 +236,53 @@ args = ["lean-lsp-mcp"]'
   chmod 600 "$config" 2>/dev/null || true
 }
 
+find_lean_project_root() {
+  local dir="$1" parent
+  dir="$(resolve_path "$dir")"
+  [ -d "$dir" ] || dir="$(dirname "$dir")"
+  while :; do
+    if [ -f "$dir/lean-toolchain" ] && \
+      { [ -f "$dir/lakefile.toml" ] || [ -f "$dir/lakefile.lean" ]; }; then
+      printf '%s\n' "$dir"
+      return 0
+    fi
+    [ "$dir" != / ] || break
+    parent="$(dirname "$dir")"
+    [ "$parent" != "$dir" ] || break
+    dir="$parent"
+  done
+  return 1
+}
+
+refresh_lean_mcp_project_path() {
+  local home="$1" start_dir="$2" config project tmp
+  config="$home/.codex/config.toml"
+  [ -f "$config" ] || return 0
+  project="$(find_lean_project_root "$start_dir" 2>/dev/null || true)"
+  [ -n "$project" ] || return 0
+  grep -Eq '^\[mcp_servers\.lean-lsp\.env\][[:space:]]*$' "$config" || return 0
+  grep -Eq '^[[:space:]]*LEAN_PROJECT_PATH[[:space:]]*=' "$config" || return 0
+
+  tmp="$config.tmp.$$"
+  awk -v project="$project" '
+    BEGIN { in_lean_env = 0 }
+    /^[[:space:]]*\[[^]]+\][[:space:]]*$/ {
+      in_lean_env = ($0 ~ /^[[:space:]]*\[mcp_servers\.lean-lsp\.env\][[:space:]]*$/)
+    }
+    in_lean_env && /^[[:space:]]*LEAN_PROJECT_PATH[[:space:]]*=/ {
+      print "LEAN_PROJECT_PATH = \"" project "\""
+      next
+    }
+    { print }
+  ' "$config" > "$tmp"
+  if cmp -s "$config" "$tmp"; then
+    rm -f "$tmp"
+  else
+    mv "$tmp" "$config"
+    chmod 600 "$config" 2>/dev/null || true
+  fi
+}
+
 ensure_profile_scaffold() {
   local home="$1"
   mkdir -p "$home/.codex" "$home/.config" "$home/.cache" \
@@ -428,11 +475,13 @@ uv_cache_python_link_allowed() {
   local root="$1" link="$2" target="$3" rel tail archive name target_dir
   rel="${link#$root/}"
   case "$rel" in
-    .cache/uv/archive-v0/*) ;;
+    .cache/uv/archive-v0/*)
+      tail="${rel#.cache/uv/archive-v0/}" ;;
+    .codex/uv_cache/archive-v0/*)
+      tail="${rel#.codex/uv_cache/archive-v0/}" ;;
     *) return 1 ;;
   esac
 
-  tail="${rel#.cache/uv/archive-v0/}"
   archive="${tail%%/*}"
   tail="${tail#*/}"
   [ -n "$archive" ] || return 1
@@ -605,6 +654,7 @@ run_codex() {
   require_safe_env
   ensure_shared_memory "$home"
   ensure_profile_launcher "$home"
+  refresh_lean_mcp_project_path "$home" "$PWD"
   check_escaping_symlinks "$home" 4 || die "profile contains disallowed top-level symlinks"
   reject_shared_symlinks
 
