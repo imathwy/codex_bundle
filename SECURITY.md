@@ -58,7 +58,9 @@ Do not force-add ignored sensitive data.
 
 ## Operational cautions
 
-Stop Codex processes before importing a live `CODEX_HOME`. The importer refuses
-conflicting SQLite roots rather than guessing how to merge them. Normal
+Stop Codex processes before importing a live `CODEX_HOME`. Imports are staged;
+failed staging directories are removed before they can become selectable
+profiles. The importer refuses conflicting SQLite roots rather than guessing how
+to merge them. Normal
 concurrent use after profiles are linked is supported by the shared SQLite WAL
 layout, but copying a database while another process is writing it is unsafe.
