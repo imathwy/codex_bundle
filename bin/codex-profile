@@ -222,6 +222,20 @@ secure_profile_perms() {
   find "$home" -xdev -type f -exec chmod go-rwx {} + 2>/dev/null || true
 }
 
+ensure_lean_mcp_config() {
+  local home="$1" config block
+  config="$home/.codex/config.toml"
+  block=$'[mcp_servers.lean-lsp]
+command = "uvx"
+args = ["lean-lsp-mcp"]'
+  if [ ! -e "$config" ]; then
+    printf "%s\n" "$block" > "$config"
+  elif [ -f "$config" ] && ! grep -Eq '^\[mcp_servers\.lean-lsp\]|^[[:space:]]*lean-lsp[[:space:]]*=' "$config"; then
+    printf "\n%s\n" "$block" >> "$config"
+  fi
+  chmod 600 "$config" 2>/dev/null || true
+}
+
 ensure_profile_scaffold() {
   local home="$1"
   mkdir -p "$home/.codex" "$home/.config" "$home/.cache" \
@@ -230,6 +244,7 @@ ensure_profile_scaffold() {
     "$home/.local" "$home/.local/share" "$home/.local/bin" 2>/dev/null || true
   [ -f "$home/.codex/auth.json" ] && chmod 600 "$home/.codex/auth.json" 2>/dev/null || true
   [ -f "$home/.codex/config.toml" ] && chmod 600 "$home/.codex/config.toml" 2>/dev/null || true
+  ensure_lean_mcp_config "$home"
 }
 
 ensure_shared_state() {
