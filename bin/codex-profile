@@ -94,6 +94,11 @@ relative_to_dir() {
 }
 
 ensure_root() {
+  local managed_root
+  for managed_root in "$PROFILES_ROOT" "$BUNDLE_ROOT/backups" "$BUNDLE_ROOT/runtime" \
+    "$RUNTIME_ROOT" "$RUNTIME_ROOT/versions" "$BUNDLE_ROOT/shared" "$SHARED_CODEX_ROOT"; do
+    [ ! -L "$managed_root" ] || die "managed root must not be a symlink: $managed_root"
+  done
   mkdir -p "$PROFILES_ROOT/default" "$BUNDLE_ROOT/backups" \
     "$RUNTIME_ROOT/versions" "$SHARED_CODEX_ROOT"
   chmod 700 "$BUNDLE_ROOT" "$BIN_DIR" "$PROFILES_ROOT" \
@@ -354,6 +359,8 @@ ensure_shared_databases() {
 ensure_shared_memory() {
   local home="$1" codex_home name
   codex_home="$home/.codex"
+  reject_escaping_symlinks "$home"
+  reject_shared_symlinks
   ensure_profile_scaffold "$home"
   ensure_shared_state
   for name in sessions archived_sessions shell_snapshots; do
@@ -361,6 +368,8 @@ ensure_shared_memory() {
   done
   link_shared_history "$codex_home"
   ensure_shared_databases "$codex_home"
+  reject_escaping_symlinks "$home"
+  reject_shared_symlinks
 }
 
 ensure_profile_launcher() {
@@ -382,6 +391,10 @@ profile_symlink_target_allowed() {
   fi
   rel="${link#$root/.codex/}"
   case "$rel" in
+    tmp/arg0/codex-arg*/apply_patch|tmp/arg0/codex-arg*/applypatch|\
+    tmp/arg0/codex-arg*/codex-execve-wrapper|tmp/arg0/codex-arg*/codex-linux-sandbox)
+      path_under "$target" "$RUNTIME_ROOT" && return 0
+      ;;
     sessions|archived_sessions|shell_snapshots|history.jsonl)
       path_under "$target" "$SHARED_CODEX_ROOT" && return 0
       ;;
@@ -491,27 +504,40 @@ init_profile() {
 }
 
 import_profile() {
-  local name="$1" src="$2" home
+  local name="$1" src="$2" home tmp
   require_name "$name"
   [ -d "$src" ] || die "source CODEX_HOME is not a directory: $src"
   ensure_root
   home="$(profile_entry "$name")"
   [ ! -e "$home" ] || die "profile already exists: $name"
-  ensure_profile_scaffold "$home"
+  tmp="$PROFILES_ROOT/.import-$name.$$"
+  [ ! -e "$tmp" ] || die "temporary import path already exists: $tmp"
 
-  if command -v rsync >/dev/null 2>&1; then
-    rsync -a "$src"/ "$home/.codex"/
-  else
-    (cd "$src" && tar -cf - .) | (cd "$home/.codex" && tar -xf -)
+  if ! (
+    set -e
+    ensure_profile_scaffold "$tmp"
+    if command -v rsync >/dev/null 2>&1; then
+      rsync -a --exclude='tmp/arg0/' "$src"/ "$tmp/.codex"/
+    else
+      (cd "$src" && tar --exclude='./tmp/arg0' -cf - .) | (cd "$tmp/.codex" && tar -xf -)
+    fi
+    reject_escaping_symlinks "$tmp"
+    reject_shared_symlinks
+    ensure_shared_memory "$tmp"
+    ensure_profile_launcher "$tmp"
+    reject_escaping_symlinks "$tmp"
+    reject_shared_symlinks
+    secure_profile_perms "$tmp"
+  ); then
+    rm -rf "$tmp"
+    die "import failed; removed incomplete profile staging for $name"
   fi
-  # Reject copied links before scaffold permission fixes or shared-state migration
-  # can follow or replace them. Re-check after installing approved bundle links.
-  reject_escaping_symlinks "$home"
-  ensure_shared_memory "$home"
-  ensure_profile_launcher "$home"
-  reject_escaping_symlinks "$home"
-  reject_shared_symlinks
-  secure_profile_perms "$home"
+
+  mv "$tmp" "$home"
+  if ! (reject_escaping_symlinks "$home" && reject_shared_symlinks); then
+    rm -rf "$home"
+    die "import became unsafe after final placement; removed incomplete profile $name"
+  fi
   note "imported $name into $home"
 }
 
@@ -530,7 +556,6 @@ run_codex() {
   launcher="$(resolve_launcher)"
   tz="${CODEX_TZ:-$DEFAULT_TZ}"
   require_safe_env
-  ensure_profile_scaffold "$home"
   ensure_shared_memory "$home"
   ensure_profile_launcher "$home"
   check_escaping_symlinks "$home" 4 || die "profile contains disallowed top-level symlinks"
@@ -580,6 +605,7 @@ list_profiles() {
     sort |
     while IFS= read -r entry; do
       name="$(basename "$entry")"
+      valid_name "$name" || continue
       target="$(profile_home "$name")"
       marker=" "
       [ -n "$active" ] && [ "$target" = "$active" ] && marker="*"
@@ -625,7 +651,7 @@ backup_profile() {
 }
 
 doctor() {
-  local ok=1 launcher tz proxy_count override_count active runtime_link active_link version_dir
+  local ok=1 launcher tz proxy_count override_count active runtime_link active_link version_dir runtime_zsh
   ensure_root
   tz="${CODEX_TZ:-$DEFAULT_TZ}"
   echo "Bundle root:    $BUNDLE_ROOT"
@@ -633,13 +659,12 @@ doctor() {
   echo "Profiles root:  $PROFILES_ROOT"
   echo "Shared root:    $SHARED_CODEX_ROOT"
   echo "Active link:    $ACTIVE_LINK"
-  echo "Profile count:  $(find "$PROFILES_ROOT" -mindepth 1 -maxdepth 1 -type d -print 2>/dev/null | wc -l | awk '{print $1}')"
+  echo "Profile count:  $(find "$PROFILES_ROOT" -mindepth 1 -maxdepth 1 -type d ! -name '.*' -print 2>/dev/null | wc -l | awk '{print $1}')"
 
   if [ -e "$ACTIVE_LINK" ]; then
     if active="$(active_home 2>/dev/null)"; then
       echo "Active home:    $active"
       echo "Active name:    $(active_name || true)"
-      ensure_profile_scaffold "$active"
       ensure_shared_memory "$active"
       ensure_profile_launcher "$active"
       if check_escaping_symlinks "$active" 4; then
@@ -679,6 +704,14 @@ doctor() {
       ok=0
     fi
     echo "Codex version:  $("$launcher" --version 2>/dev/null || echo unknown)"
+    runtime_zsh="$version_dir/codex-resources/zsh/bin/zsh"
+    if [ -x "$runtime_zsh" ]; then
+      if "$runtime_zsh" --version >/dev/null 2>&1; then
+        echo "Runtime zsh:    available for optional zsh-fork backend"
+      else
+        echo "Runtime zsh:    unavailable on this host (optional zsh-fork backend only)"
+      fi
+    fi
   else
     echo "Launcher:       <missing or unsafe>"
     ok=0
