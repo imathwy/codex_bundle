@@ -49,6 +49,11 @@ Every profile automatically registers the `lean-lsp` stdio MCP server with
 entry on first initialization. The `uvx` executable is a host prerequisite; run
 `uvx --version` before starting Codex and install `uv` if it is missing.
 
+When Codex starts inside a Lean/Lake project, the launcher refreshes an existing
+`mcp_servers.lean-lsp.env.LEAN_PROJECT_PATH` to the nearest project root. This
+prevents imported or recovery-generated profile configs from retaining deleted
+temporary project paths while still allowing one profile to work across repos.
+
 ## Shared memory model
 
 Each profile has an isolated `HOME` and `CODEX_HOME`:
