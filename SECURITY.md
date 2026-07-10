@@ -19,8 +19,10 @@ The following local state is intentionally shared between accounts:
 
 Shared state lives under `shared/codex/`. Profile symlinks may point there only
 for the allowlisted state names. Other profile symlinks must remain in the
-profile, except the allowlisted launcher link to the bundled runtime. Shared
-state itself may not link outside its root.
+profile, except the allowlisted launcher link to the bundled runtime and uv's
+cached `bin/python*` links to executable system Python interpreters under
+`/usr/bin` or `/usr/local/bin`. Shared state itself may not link outside its
+root.
 
 Sharing local state means every local OS user/process that can read this bundle
 can read all shared conversations and memories. Keep the entire bundle private.
