@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir() {
+  local source="$1" dir target
+  while [ -L "$source" ]; do
+    dir="$(cd -P "$(dirname "$source")" >/dev/null 2>&1 && pwd)"
+    target="$(readlink "$source")"
+    case "$target" in
+      /*) source="$target" ;;
+      *) source="$dir/$target" ;;
+    esac
+  done
+  cd -P "$(dirname "$source")" >/dev/null 2>&1 && pwd
+}
+
+BIN_DIR="$(script_dir "${BASH_SOURCE[0]}")"
+exec "$BIN_DIR/codex-profile" run-current "$@"
