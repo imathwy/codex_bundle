@@ -30,7 +30,8 @@ Switch the default account and resume shared sessions:
 ./bin/codex
 ./bin/codex-profile resume
 
-./bin/codex-profile resume account-b -- --last
+./bin/codex-profile resume-last account-b
+./bin/codex-profile resume-last account-b -- --all
 ./bin/codex-profile resume account-b -- --all
 ```
 
@@ -42,12 +43,30 @@ Switch the default account and resume shared sessions:
 ./bin/codex-profile resume -- <session-id>
 ```
 
+### Fast resume
+
+For a large shared session store, use `resume-last` to continue the newest
+session without opening the picker:
+
+```bash
+./bin/codex-profile resume-last
+./bin/codex-profile resume-last account-b
+./bin/codex-profile resume-last account-b -- --all
+```
+
+Codex's `--last` path consults its indexed state database first. Passing an exact
+session UUID to `resume` is also fast. The standard picker used by bare
+`resume` currently scans rollout JSONL files to repair metadata before listing
+them, so its initial load time grows with the shared session archive.
+
 ## Lean LSP MCP
 
 Every profile automatically registers the `lean-lsp` stdio MCP server with
 `command = "uvx"` and `args = ["lean-lsp-mcp"]`. New profiles receive the same
 entry on first initialization. The `uvx` executable is a host prerequisite; run
-`uvx --version` before starting Codex and install `uv` if it is missing.
+`uvx --version` before starting Codex and install `uv` if it is missing. Both
+`run` and `doctor` report an actionable warning when the configured runner is
+missing; `doctor` treats it as a failed prerequisite.
 
 When Codex starts inside a Lean/Lake project, the launcher refreshes an existing
 `mcp_servers.lean-lsp.env.LEAN_PROJECT_PATH` to the nearest project root. This
@@ -105,17 +124,18 @@ is deliberately not dereferenced into profile backups.
 
 ## Runtime
 
-The bundled runtime is Codex CLI 0.144.6 for x86_64 Linux (musl). The tracked
+The bundled runtime is Codex CLI 0.146.0 for x86_64 Linux (musl). The tracked
 runtime archive is split into Git-friendly parts. `doctor` reassembles it after
 a fresh clone and checks both archive and extracted-file SHA-256 manifests.
-The 0.144.1 and 0.144.0 split archives are retained as rollback artifacts.
+The 0.145.0, 0.144.6, 0.144.1, and 0.144.0 split archives are retained as
+rollback artifacts.
 
 The runtime includes the companion code-mode host and the `rg`, `bwrap`, and
 `zsh` resources shipped by the installed `@openai/codex` platform package.
 
 On this GLIBC 2.35 host, the upstream `zsh` resource requires GLIBC 2.38 and is
 not executable. Its `shell_zsh_fork` and `unified_exec_zsh_fork` features are
-disabled by default in Codex 0.144.6; the normal shell backend, `rg`, and `bwrap`
+disabled by default in Codex 0.146.0; the normal shell backend, `rg`, and `bwrap`
 remain available. `doctor` reports this optional-resource compatibility status.
 
 ## Safety defaults
