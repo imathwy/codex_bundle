@@ -34,6 +34,7 @@ Usage:
   codex-profile switch <name>
   codex-profile run [name] [-- <codex-args>...]
   codex-profile resume [name] [-- <codex-resume-args>...]
+  codex-profile resume-last [name] [-- <codex-resume-args>...]
   codex-profile backup [name] [backup.tar.gz]
   codex-profile doctor
 
@@ -49,8 +50,8 @@ Environment:
   CODEX_ALLOW_ENV_OVERRIDES=1    allow OpenAI/provider/auth environment overrides
 
 Model:
-  Account credentials and config stay per profile. Sessions, history, explicit
-  Codex memories, goals, thread state, logs, and shell snapshots are linked to
+  Account credentials and config stay per profile. Sessions, session index, history,
+  explicit Codex memories, goals, thread state, logs, and shell snapshots are linked to
   shared/codex so every account sees the same local memory and resume state.
   Use `--` before a prompt or session id that could be mistaken for a profile.
 USAGE
@@ -244,6 +245,30 @@ args = ["lean-lsp-mcp"]'
   chmod 600 "$config" 2>/dev/null || true
 }
 
+lean_mcp_configured() {
+  local home="$1" config
+  config="$home/.codex/config.toml"
+  [ -f "$config" ] &&
+    grep -Eq '^\[mcp_servers\.lean-lsp\]|^[[:space:]]*lean-lsp[[:space:]]*=' "$config"
+}
+
+find_lean_mcp_runner() {
+  local home="$1" host_home="${2:-${HOME:-}}" runner
+  runner="$home/.local/bin/uvx"
+  if [ -x "$runner" ]; then
+    printf '%s\n' "$runner"
+    return 0
+  fi
+  if [ -n "$host_home" ]; then
+    runner="$host_home/.local/bin/uvx"
+    if [ -x "$runner" ]; then
+      printf '%s\n' "$runner"
+      return 0
+    fi
+  fi
+  command -v uvx 2>/dev/null || return 1
+}
+
 find_lean_project_root() {
   local dir="$1" parent
   dir="$(resolve_path "$dir")"
@@ -308,11 +333,11 @@ ensure_shared_state() {
   for name in sessions archived_sessions shell_snapshots; do
     mkdir -p "$SHARED_CODEX_ROOT/$name"
   done
-  touch "$SHARED_CODEX_ROOT/history.jsonl"
+  touch "$SHARED_CODEX_ROOT/history.jsonl" "$SHARED_CODEX_ROOT/session_index.jsonl"
   chmod 700 "$BUNDLE_ROOT/shared" "$SHARED_CODEX_ROOT" \
     "$SHARED_CODEX_ROOT/sessions" "$SHARED_CODEX_ROOT/archived_sessions" \
     "$SHARED_CODEX_ROOT/shell_snapshots" 2>/dev/null || true
-  chmod 600 "$SHARED_CODEX_ROOT/history.jsonl" 2>/dev/null || true
+  chmod 600 "$SHARED_CODEX_ROOT/history.jsonl" "$SHARED_CODEX_ROOT/session_index.jsonl" 2>/dev/null || true
 }
 
 link_shared_dir() {
@@ -355,6 +380,25 @@ link_shared_history() {
   if [ -e "$profile_path" ]; then
     [ -f "$profile_path" ] || die "cannot share non-file path: $profile_path"
     [ ! -s "$profile_path" ] || cat "$profile_path" >> "$target"
+    rm -f "$profile_path"
+  fi
+  rel="$(relative_to_dir "$(dirname "$profile_path")" "$target")"
+  ln -sfn "$rel" "$profile_path"
+  chmod 600 "$target" 2>/dev/null || true
+}
+
+link_shared_session_index() {
+  local codex_home="$1" mode="${2:-full}" profile_path target rel
+  profile_path="$codex_home/session_index.jsonl"
+  target="$SHARED_CODEX_ROOT/session_index.jsonl"
+  touch "$target"
+
+  if [ -L "$profile_path" ]; then
+    [ "$mode" = fast ] && return 0
+    path_under "$(resolve_path "$profile_path")" "$SHARED_CODEX_ROOT" && return 0
+    die "refusing to replace external symlink: $profile_path -> $(resolve_path "$profile_path")"
+  fi
+  if [ -e "$profile_path" ]; then
     rm -f "$profile_path"
   fi
   rel="$(relative_to_dir "$(dirname "$profile_path")" "$target")"
@@ -451,6 +495,7 @@ ensure_shared_memory() {
     link_shared_dir "$codex_home" "$name" "$mode"
   done
   link_shared_history "$codex_home" "$mode"
+  link_shared_session_index "$codex_home" "$mode"
   ensure_shared_databases "$codex_home" "$mode"
   case "$mode" in
     full) reject_escaping_symlinks "$home" ;;
@@ -482,7 +527,7 @@ profile_symlink_target_allowed() {
     tmp/arg0/codex-arg*/codex-execve-wrapper|tmp/arg0/codex-arg*/codex-linux-sandbox)
       path_under_resolved "$target" "$runtime_root" && return 0
       ;;
-    sessions|archived_sessions|shell_snapshots|history.jsonl)
+    sessions|archived_sessions|shell_snapshots|history.jsonl|session_index.jsonl)
       path_under_resolved "$target" "$shared_root" && return 0
       ;;
     *.sqlite)
@@ -578,7 +623,7 @@ proxy_env_lines() {
 override_env_lines() {
   env | awk -F= '{
     name=$1; uname=toupper(name)
-    if (uname ~ /^CODEX_(BUNDLE_ROOT|PROFILES_ROOT|ACTIVE_PROFILE_LINK|SHARED_ROOT|REAL_BIN|TZ|ALLOW_PROXY|ALLOW_EXTERNAL_RUNTIME|ALLOW_ENV_OVERRIDES)$/) next
+    if (uname ~ /^CODEX_(BUNDLE_ROOT|PROFILES_ROOT|ACTIVE_PROFILE_LINK|SHARED_ROOT|REAL_BIN|TZ|ALLOW_PROXY|ALLOW_EXTERNAL_RUNTIME|ALLOW_ENV_OVERRIDES|HOME|THREAD_ID|CI)$/) next
     if (uname ~ /^(OPENAI_|CODEX_|AZURE_OPENAI_|AZURE_|AWS_|GOOGLE_APPLICATION_CREDENTIALS$|GOOGLE_CLOUD_)/) print name"=<set>"
   }'
 }
@@ -674,7 +719,7 @@ switch_profile() {
 }
 
 run_codex() {
-  local home="$1" launcher tz host_home="${HOME:-}"
+  local home="$1" launcher tz host_home="${HOME:-}" lean_runner
   shift
   launcher="$(resolve_launcher)"
   tz="${CODEX_TZ:-$DEFAULT_TZ}"
@@ -683,6 +728,10 @@ run_codex() {
   ensure_profile_launcher "$home"
   refresh_lean_mcp_project_path "$home" "$PWD"
   reject_shared_symlinks
+  if lean_mcp_configured "$home" &&
+    ! lean_runner="$(find_lean_mcp_runner "$home" "$host_home")"; then
+    note "lean-lsp MCP requires uvx, but none is executable; install uv before restarting Codex"
+  fi
 
   export HOME="$home"
   export CODEX_HOME="$home/.codex"
@@ -691,6 +740,9 @@ run_codex() {
   export XDG_DATA_HOME="$home/.local/share"
   export TZ="$tz"
   export PATH="$BIN_DIR:$home/.local/bin:${host_home:+$host_home/.local/bin:}$PATH"
+  # A launcher invoked from an existing Codex session inherits these markers.
+  # They belong to the parent session, not to the profile being launched.
+  unset CODEX_THREAD_ID CODEX_CI
   exec "$launcher" "$@"
 }
 
@@ -716,6 +768,18 @@ resume_profile() {
   else
     [ "${1:-}" = "--" ] && shift
     run_profile -- resume "$@"
+  fi
+}
+
+resume_last_profile() {
+  local name="${1:-}"
+  if [ -n "$name" ] && [ "$name" != "--" ]; then
+    shift
+    [ "${1:-}" = "--" ] && shift
+    run_profile "$name" -- resume --last "$@"
+  else
+    [ "${1:-}" = "--" ] && shift
+    run_profile -- resume --last "$@"
   fi
 }
 
@@ -774,7 +838,7 @@ backup_profile() {
 }
 
 doctor() {
-  local ok=1 launcher tz proxy_count override_count active runtime_link active_link version_dir runtime_zsh
+  local ok=1 launcher tz proxy_count override_count active runtime_link active_link version_dir runtime_zsh lean_runner
   ensure_root
   tz="${CODEX_TZ:-$DEFAULT_TZ}"
   echo "Bundle root:    $BUNDLE_ROOT"
@@ -802,6 +866,16 @@ doctor() {
       else
         echo "Shared memory:  missing or not linked"
         ok=0
+      fi
+      if lean_mcp_configured "$active"; then
+        if lean_runner="$(find_lean_mcp_runner "$active")"; then
+          echo "Lean MCP uvx:   $lean_runner ($("$lean_runner" --version 2>/dev/null || echo unknown))"
+        else
+          echo "Lean MCP uvx:   missing (install uv so uvx is available)"
+          ok=0
+        fi
+      else
+        echo "Lean MCP uvx:   not configured"
       fi
     else
       echo "Active home:    invalid"
@@ -897,6 +971,7 @@ main() {
     run) run_profile "$@" ;;
     run-current) run_profile -- "$@" ;;
     resume) resume_profile "$@" ;;
+    resume-last) resume_last_profile "$@" ;;
     backup) backup_profile "$@" ;;
     doctor|health) doctor ;;
     *) die "unknown command: $cmd" ;;
