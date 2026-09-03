@@ -410,6 +410,82 @@ def indexed_rollout_paths(state: Path) -> dict[str, Path]:
         }
 
 
+def runtime_rollout_location(
+    rollout_path: Path, runtime_root: Path
+) -> tuple[Path, Path] | None:
+    try:
+        parts = rollout_path.relative_to(runtime_root).parts
+    except ValueError:
+        return None
+    if (
+        len(parts) < 3
+        or not parts[0].startswith("codex-profile-home.")
+        or parts[1] != "sessions"
+        or any(part in ("", ".", "..") for part in parts[2:])
+    ):
+        return None
+    return Path(*parts[2:]), runtime_root / parts[0]
+
+
+def repair_runtime_rollout_paths(
+    state: Path,
+    shared: Path,
+    runtime_root: Path,
+    *,
+    prune_stale: bool = False,
+) -> dict[str, int]:
+    stats = defaultdict(int)
+    sessions = (shared / "sessions").resolve()
+    runtime_root = runtime_root.resolve()
+    with state_db(state) as db:
+        db.execute("PRAGMA foreign_keys=ON")
+        rows = db.execute(
+            "SELECT id, rollout_path FROM threads WHERE rollout_path LIKE ?",
+            (str(runtime_root / "codex-profile-home.%/sessions/%"),),
+        ).fetchall()
+        for row in rows:
+            location = runtime_rollout_location(Path(row["rollout_path"]), runtime_root)
+            if location is None:
+                stats["ignored"] += 1
+                continue
+            relative, runtime_home = location
+            canonical = sessions / relative
+            if not path_is_under(canonical.resolve(), sessions):
+                stats["ignored"] += 1
+                continue
+            if canonical.is_file() and not canonical.is_symlink():
+                db.execute(
+                    "UPDATE threads SET rollout_path=? WHERE id=?",
+                    (str(canonical), row["id"]),
+                )
+                stats["normalized"] += 1
+            elif runtime_home.is_dir() and not runtime_home.is_symlink():
+                stats["live_missing"] += 1
+            elif prune_stale:
+                db.execute("DELETE FROM threads WHERE id=?", (row["id"],))
+                stats["pruned"] += 1
+            else:
+                stats["stale"] += 1
+        db.commit()
+    return stats
+
+
+def cmd_repair_runtime_paths(args) -> None:
+    _, shared, state, _ = paths()
+    runtime_root = Path(
+        args.runtime_root or f"/var/tmp/codex-profile-runtime-{os.getuid()}"
+    )
+    stats = repair_runtime_rollout_paths(
+        state, shared, runtime_root, prune_stale=args.prune_stale
+    )
+    if not args.quiet or stats["pruned"]:
+        print(
+            f"runtime rollout paths: normalized={stats['normalized']} "
+            f"pruned={stats['pruned']} stale={stats['stale']} "
+            f"live_missing={stats['live_missing']}"
+        )
+
+
 def import_source_rollouts(
     entry: dict,
     shared: Path,
@@ -1555,6 +1631,11 @@ def parser():
     )
     visible.add_argument("--quiet", action="store_true")
     visible.set_defaults(func=cmd_ensure_visible)
+    repair_paths = sub.add_parser("repair-runtime-paths")
+    repair_paths.add_argument("--runtime-root")
+    repair_paths.add_argument("--prune-stale", action="store_true")
+    repair_paths.add_argument("--quiet", action="store_true")
+    repair_paths.set_defaults(func=cmd_repair_runtime_paths)
     handoff = sub.add_parser("handoff")
     handoff.add_argument("--session-id", required=True)
     handoff.add_argument("--output", required=True)

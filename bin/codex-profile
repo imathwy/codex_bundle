@@ -1583,7 +1583,7 @@ run_launcher_with_profile_guard() {
 run_codex() {
   local home="$1" launcher tz host_home="${HOME:-}" lean_runner lean_project log_dir log_key runtime_path
   local runtime_codex_home runtime_auth_before runtime_config_before
-  local expected_auth_identity="" command status finalize_status cleanup_status
+  local expected_auth_identity="" command status repair_status finalize_status cleanup_status
   shift
   launcher="$(resolve_launcher)"
   tz="${CODEX_TZ:-$DEFAULT_TZ}"
@@ -1594,6 +1594,10 @@ run_codex() {
   ensure_trusted_profile_state "$home"
   reject_shared_symlinks
   direct_profile_runtime_guard "$home"
+  if ! "$BIN_DIR/codex-history" repair-runtime-paths \
+    --runtime-root "$(runtime_codex_home_root)" --quiet; then
+    die "could not repair temporary rollout paths before launch"
+  fi
   lean_project=""
   if lean_mcp_configured "$home"; then
     lean_project="$(find_lean_project_root "$PWD" 2>/dev/null || true)"
@@ -1648,6 +1652,9 @@ run_codex() {
   run_launcher_with_profile_guard "$home" "$launcher" "$lean_project" \
     "$runtime_codex_home" "$@"
   status=$?
+  "$BIN_DIR/codex-history" repair-runtime-paths \
+    --runtime-root "$(runtime_codex_home_root)" --quiet
+  repair_status=$?
   finalize_runtime_codex_home "$home" "$runtime_codex_home" "$command" \
     "$runtime_auth_before" "$expected_auth_identity" "$runtime_config_before"
   finalize_status=$?
@@ -1657,6 +1664,9 @@ run_codex() {
     RUNTIME_CODEX_HOME_TO_CLEAN=""
   fi
   set -e
+  if [ "$status" -eq 0 ] && [ "$repair_status" -ne 0 ]; then
+    status="$repair_status"
+  fi
   if [ "$status" -eq 0 ] && [ "$finalize_status" -ne 0 ]; then
     status="$finalize_status"
   fi

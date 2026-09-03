@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sqlite3
 import time
 import unittest
 from pathlib import Path
@@ -88,7 +89,11 @@ class CodexProfileTests(unittest.TestCase):
             )
 
             self.assertEqual(fast_result.returncode, 0, fast_result.stderr)
-            self.assertFalse(history_log.exists())
+            fast_calls = history_log.read_text(encoding="utf-8").splitlines()
+            self.assertTrue(fast_calls)
+            self.assertTrue(
+                all(call.startswith("repair-runtime-paths ") for call in fast_calls)
+            )
             fast_runtime_state = runtime_log.read_text(encoding="utf-8")
             self.assertIn(f"HOME={selected}\n", fast_runtime_state)
             self.assertIn("ARGS=resume\n", fast_runtime_state)
@@ -111,10 +116,15 @@ class CodexProfileTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stderr)
             calls = history_log.read_text(encoding="utf-8").splitlines()
-            self.assertIn(f"sync-history --profile-home {selected}", calls[0])
-            self.assertTrue(calls[0].endswith("--lock-timeout 10 --quiet"))
+            maintenance_calls = [
+                call
+                for call in calls
+                if call.startswith(("sync-history ", "ensure-visible "))
+            ]
+            self.assertIn(f"sync-history --profile-home {selected}", maintenance_calls[0])
+            self.assertTrue(maintenance_calls[0].endswith("--lock-timeout 10 --quiet"))
             self.assertEqual(
-                calls[1], "ensure-visible --keep-days 3 --lock-timeout 10 --quiet"
+                maintenance_calls[1], "ensure-visible --keep-days 3 --lock-timeout 10 --quiet"
             )
             runtime_state = runtime_log.read_text(encoding="utf-8")
             self.assertIn(f"HOME={selected}\n", runtime_state)
@@ -235,7 +245,12 @@ class CodexProfileTests(unittest.TestCase):
             (profiles / "current").symlink_to("default")
             shared = root / "shared/codex"
             shared.mkdir(parents=True)
-            (shared / "state_5.sqlite").write_bytes(b"not-empty")
+            with sqlite3.connect(shared / "state_5.sqlite") as db:
+                db.execute(
+                    "CREATE TABLE threads ("
+                    "id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL"
+                    ")"
+                )
 
             environment = os.environ.copy()
             environment.update(

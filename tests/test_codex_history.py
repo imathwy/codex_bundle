@@ -137,6 +137,58 @@ def insert_thread(
 
 
 class CodexHistoryTests(unittest.TestCase):
+    def test_repair_runtime_rollout_paths_normalizes_and_prunes_safely(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            shared = root / "shared/codex"
+            sessions = shared / "sessions"
+            shared.mkdir(parents=True)
+            state = shared / "state_5.sqlite"
+
+            runtime_root = root / "runtime-homes"
+            dead_home = runtime_root / "codex-profile-home.dead00"
+            live_home = runtime_root / "codex-profile-home.live00"
+            live_home.mkdir(parents=True)
+
+            existing_id = str(uuid.uuid4())
+            existing = write_rollout(sessions, existing_id)
+            relative = existing.relative_to(sessions)
+            ghost_id = str(uuid.uuid4())
+            live_id = str(uuid.uuid4())
+            with sqlite3.connect(state) as db:
+                create_state_schema(db)
+                insert_thread(
+                    db,
+                    existing_id,
+                    dead_home / "sessions" / relative,
+                    1000,
+                )
+                insert_thread(
+                    db,
+                    ghost_id,
+                    dead_home / "sessions/2026/09/03/ghost.jsonl",
+                    2000,
+                )
+                insert_thread(
+                    db,
+                    live_id,
+                    live_home / "sessions/2026/09/03/not-created-yet.jsonl",
+                    3000,
+                )
+
+            stats = codex_history.repair_runtime_rollout_paths(
+                state, shared, runtime_root, prune_stale=True
+            )
+
+            self.assertEqual(stats["normalized"], 1)
+            self.assertEqual(stats["pruned"], 1)
+            self.assertEqual(stats["live_missing"], 1)
+            with sqlite3.connect(state) as db:
+                rows = dict(db.execute("SELECT id, rollout_path FROM threads"))
+            self.assertEqual(rows[existing_id], str(existing.resolve()))
+            self.assertNotIn(ghost_id, rows)
+            self.assertIn(live_id, rows)
+
     def test_archive_plan_keeps_recent_lineage_and_only_archives_excess(self) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary)

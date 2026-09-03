@@ -306,6 +306,12 @@ unarchive operations retain the normal per-profile Codex-home boundary. Exact
 `resume <UUID>` launches also hold a profile-local kernel lock, so the same
 session cannot be resumed twice accidentally while different sessions remain
 concurrent. To avoid repeatedly loading the roughly 300 MB runtime from GPFS,
+Before and after each launch, the wrapper rewrites thread-index paths that point
+through an isolated runtime home to the stable shared sessions directory. Only
+rows whose rollout file exists are changed automatically; missing rows are never
+deleted unless `codex-history repair-runtime-paths --prune-stale` is requested
+explicitly.
+
 the launcher keeps a manifest-keyed node-local copy under
 `/tmp/codex-bundle-runtime-cache-<uid>/` and executes that copy by default.
 Set `CODEX_USE_LOCAL_RUNTIME_CACHE=0` to bypass it or
