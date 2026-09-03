@@ -1,3 +1,6 @@
+# Python-generated local caches.
+__pycache__/
+*.py[cod]
 # Local account profiles and active-profile link.
 profiles/*
 !profiles/.keep
