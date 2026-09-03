@@ -65,11 +65,14 @@ authoritative `.codex-profile-state` directory; established non-sensitive state
 and shared sessions/databases are linked back to their normal locations. New and
 imported profiles create this trusted state atomically.
 
-The ordinary `.codex/auth.json` and `.codex/config.toml` paths remain
-compatibility mirrors. A stale launcher in another container can overwrite
-those mirrors, but a new launch never trusts them once the protected state has
-been initialized. This is important when several containers mount the same
-profile through GPFS.
+The ordinary `.codex/auth.json` remains a compatibility mirror and is never
+trusted after protected state initialization. The ordinary
+`.codex/config.toml` remains the user-editable configuration path: direct edits
+to that regular file are accepted into protected state at launch and on session
+exit. Runtime-internal configuration rewrites still occur only in the isolated
+home and are discarded by default. This keeps credentials protected while
+allowing normal manual configuration changes when several containers mount the
+same profile through GPFS.
 
 This isolates TUI-internal conversation transitions. In particular, `/new`,
 `/btw` (the `/side` alias), `/side`, and `/fork` may rewrite their runtime
@@ -78,10 +81,12 @@ on exit by default. Same-account auth token refreshes and explicit
 login/logout are committed to the trusted state; account-identity changes are
 discarded otherwise.
 
-For an intentional config change, first make sure no other protected launch of
-that profile is running and set `CODEX_ALLOW_PROFILE_CONFIG_CHANGE=1`. The
-launcher also watches and repairs the compatibility mirrors as defense in depth
-against an old or external process that still writes through `HOME/.codex`.
+For an intentional config change, edit the profile's ordinary
+`.codex/config.toml`; the launcher accepts that regular file into protected
+state. `CODEX_ALLOW_PROFILE_CONFIG_CHANGE=1` is only needed when a config change
+made inside the Codex runtime itself should persist. The launcher continues to
+watch and repair the auth compatibility mirror as defense in depth against an
+old or external process that still writes through `HOME/.codex`.
 
 Before launching, the wrapper scans for Codex runtime processes whose
 environment still points at the profile's persistent `.codex` directory. It

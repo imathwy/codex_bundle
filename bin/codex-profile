@@ -1075,6 +1075,28 @@ sync_profile_from_trusted_unlocked() {
   return "$result"
 }
 
+adopt_persistent_config_unlocked() {
+  local home="$1" state value marker target
+  state="$home/.codex-profile-state"
+  value="$state/config.toml"
+  marker="$state/config.toml.missing"
+  target="$home/.codex/config.toml"
+  if [ ! -e "$target" ] && [ ! -L "$target" ]; then
+    return 0
+  fi
+  if [ ! -f "$target" ] || [ -L "$target" ]; then
+    note "ignored unsafe persistent config path: $target"
+    return 0
+  fi
+  if [ -f "$value" ] && [ ! -L "$value" ] && cmp -s -- "$target" "$value"; then
+    return 0
+  fi
+  if ! restore_guarded_file "$target" "$value" 600 || ! rm -f -- "$marker"; then
+    return 1
+  fi
+  note "accepted user edit from persistent profile config: $target"
+}
+
 ensure_trusted_profile_state() {
   local home="$1" state lock staging source name state_lock_fd
   state="$home/.codex-profile-state"
@@ -1118,6 +1140,11 @@ ensure_trusted_profile_state() {
     note "initialized trusted auth/config state for profile $(basename "$home")"
   fi
   trusted_profile_state_validate_unlocked "$home"
+  if ! adopt_persistent_config_unlocked "$home"; then
+    flock -u "$state_lock_fd" 2>/dev/null || true
+    exec {state_lock_fd}>&-
+    die "could not persist user-edited profile config: $home/.codex/config.toml"
+  fi
   if ! sync_profile_from_trusted_unlocked "$home"; then
     note "the trusted profile state is valid, but its persistent mirror is currently contested"
   fi
@@ -1484,7 +1511,7 @@ watch_profile_guard() {
 
 run_launcher_with_profile_guard() {
   local home="$1" launcher="$2" lean_project="$3" runtime_home="$4" command="${5:-}"
-  local auth config tool poll allow_auth allow_config protect_auth=1 protect_config=1
+  local auth config tool poll allow_auth allow_config protect_auth=1 protect_config=0
   local guard_dir auth_backup="" config_backup="" before="" status watcher_pid
   shift 4
   auth="$runtime_home/auth.json"
@@ -1506,9 +1533,6 @@ run_launcher_with_profile_guard() {
   if [ "$allow_auth" = 1 ] || [ "$command" = login ] ||
     [ "$command" = logout ] || [ ! -e "$auth" ]; then
     protect_auth=0
-  fi
-  if [ "$allow_config" = 1 ] || [ ! -e "$config" ]; then
-    protect_config=0
   fi
   if [ "$protect_auth" -eq 0 ] && [ "$protect_config" -eq 0 ]; then
     set +e

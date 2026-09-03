@@ -368,7 +368,6 @@ class CodexProfileTests(unittest.TestCase):
                 )
 
             wrong_remote_auth = '{"OPENAI_API_KEY":"remote-wrong"}\n'
-            wrong_remote_config = 'model = "remote-wrong"\n'
             legacy_writer = root / "legacy-profile-writer"
             legacy_writer.write_text(
                 "#!/usr/bin/env bash\n"
@@ -378,10 +377,6 @@ class CodexProfileTests(unittest.TestCase):
                 '> "$TEST_PROFILE_CODEX_HOME/auth.json.remote"\n'
                 '  mv -f "$TEST_PROFILE_CODEX_HOME/auth.json.remote" '
                 '"$TEST_PROFILE_CODEX_HOME/auth.json"\n'
-                "  printf '%s\\n' 'model = \"remote-wrong\"' "
-                '> "$TEST_PROFILE_CODEX_HOME/config.toml.remote"\n'
-                '  mv -f "$TEST_PROFILE_CODEX_HOME/config.toml.remote" '
-                '"$TEST_PROFILE_CODEX_HOME/config.toml"\n'
                 "  sleep 0.01\n"
                 "done\n",
                 encoding="utf-8",
@@ -402,16 +397,9 @@ class CodexProfileTests(unittest.TestCase):
                             )
                             == wrong_remote_auth
                         )
-                        config_is_wrong = (
-                            (selected_codex / "config.toml").read_text(
-                                encoding="utf-8"
-                            )
-                            == wrong_remote_config
-                        )
                     except FileNotFoundError:
                         auth_is_wrong = False
-                        config_is_wrong = False
-                    if auth_is_wrong and config_is_wrong:
+                    if auth_is_wrong:
                         break
                     time.sleep(0.01)
                 else:
@@ -442,7 +430,25 @@ class CodexProfileTests(unittest.TestCase):
             self.assertEqual(
                 (selected_codex / "config.toml").read_text(encoding="utf-8"),
                 stable_config,
+
             )
+            manual_config = stable_config.replace(
+                'model = "stable"', 'model = "manually-stable"'
+            )
+            (selected_codex / "config.toml").write_text(
+                manual_config, encoding="utf-8"
+            )
+            manual_result = run_mode("verify")
+            self.assertEqual(manual_result.returncode, 0, manual_result.stderr)
+            self.assertEqual(
+                (selected_codex / "config.toml").read_text(encoding="utf-8"),
+                manual_config,
+            )
+            self.assertEqual(
+                (trusted_state / "config.toml").read_text(encoding="utf-8"),
+                manual_config,
+            )
+            stable_config = manual_config
 
             refresh_result = run_mode("refresh")
             self.assertEqual(refresh_result.returncode, 0, refresh_result.stderr)
@@ -484,7 +490,7 @@ class CodexProfileTests(unittest.TestCase):
                 for line in runtime_state.splitlines()
                 if line.startswith("CODEX_HOME=")
             ]
-            self.assertEqual(len(runtime_homes), 6)
+            self.assertEqual(len(runtime_homes), 7)
             self.assertTrue(
                 all(not runtime_home.exists() for runtime_home in runtime_homes)
             )
