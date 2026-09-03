@@ -1,0 +1,13 @@
+#!/bin/sh
+# Add this bundle's binaries to PATH if they are not present yet.
+codex_bundle_bin=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+# Affix colons on either side of PATH to simplify matching.
+case ":${PATH}:" in
+    *:"${codex_bundle_bin}":*)
+        ;;
+    *)
+        # Prepend so the bundled binaries override system-installed versions.
+        export PATH="${codex_bundle_bin}:$PATH"
+        ;;
+esac
+unset codex_bundle_bin
