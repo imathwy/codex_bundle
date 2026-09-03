@@ -31,10 +31,18 @@ Usage:
   codex-profile paths
   codex-profile init <name>
   codex-profile import <name> <codex-home>
+  codex-profile import-history <codex-home> [--cwd <absolute-cwd>]
+  codex-profile sync-history [sync-options...]
   codex-profile switch <name>
   codex-profile run [name] [-- <codex-args>...]
   codex-profile resume [name] [-- <codex-resume-args>...]
+  codex-profile resume-last [name] [-- <codex-resume-args>...]
+  codex-profile handoff <target-profile> <session-id>
   codex-profile backup [name] [backup.tar.gz]
+  codex-profile archive-status [archive-options...]
+  codex-profile archive-run [archive-options...]
+  codex-profile restore <session-id>
+  codex-profile restore-project <absolute-cwd>
   codex-profile doctor
 
 Environment:
@@ -44,14 +52,27 @@ Environment:
   CODEX_SHARED_ROOT              default: $CODEX_BUNDLE_ROOT/shared/codex
   CODEX_REAL_BIN                 optional Codex launcher path; must stay in bundle unless allowed
   CODEX_TZ                       default: JST-9
+  CODEX_HISTORY_KEEP_DAYS        recent resume-history window; default: 3
+  CODEX_HISTORY_STABLE_SECONDS   minimum age before importing a closed rollout; default: 0
+  CODEX_HISTORY_LOCK_TIMEOUT_SECONDS      history maintenance lock wait; default: 10
+  CODEX_HISTORY_DB_TIMEOUT_SECONDS        history SQLite busy wait; default: 10
+  CODEX_HISTORY_PREPARE_INTERVAL_SECONDS  reuse successful resume prep; default: 60
+  CODEX_AUTO_HISTORY_MAINTENANCE=1        opt in to blocking resume-time history prep
+  CODEX_RUNTIME_CACHE_LOCK_TIMEOUT_SECONDS runtime cache lock wait; default: 30
   CODEX_ALLOW_PROXY=1            allow proxy environment variables
   CODEX_ALLOW_EXTERNAL_RUNTIME=1 allow CODEX_REAL_BIN outside this bundle
   CODEX_ALLOW_ENV_OVERRIDES=1    allow OpenAI/provider/auth environment overrides
+  CODEX_ALLOW_DIRECT_PROFILE_RUNTIME=1 bypass old/direct CODEX_HOME process check
+  CODEX_ALLOW_AUTH_IDENTITY_CHANGE=1 allow a non-login launch to switch accounts
+  CODEX_ALLOW_PROFILE_CONFIG_CHANGE=1 allow Codex to persist config.toml changes
+  CODEX_PROFILE_GUARD_POLL_SECONDS profile auth/config guard interval; default: 0.5
 
 Model:
-  Account credentials and config stay per profile. Sessions, history, explicit
-  Codex memories, goals, thread state, logs, and shell snapshots are linked to
-  shared/codex so every account sees the same local memory and resume state.
+  Account credentials and config have a protected per-profile baseline. Runtime copies
+  and persistent compatibility mirrors cannot replace that baseline implicitly.
+  Sessions, session index, history, explicit Codex memories, goals, thread state, and
+  shell snapshots are linked to shared/codex so every account sees the same local
+  memory and resume state. Logs stay profile-local.
   Use `--` before a prompt or session id that could be mistaken for a profile.
 USAGE
 }
@@ -231,17 +252,53 @@ secure_profile_perms() {
 }
 
 ensure_lean_mcp_config() {
-  local home="$1" config block
+  local home="$1" config block config_lock_fd
   config="$home/.codex/config.toml"
-  block=$'[mcp_servers.lean-lsp]
-command = "uvx"
-args = ["lean-lsp-mcp"]'
+  block="[mcp_servers.lean-lsp]
+command = \"$BIN_DIR/uvx\"
+args = [\"lean-lsp-mcp\"]"
+  command -v flock >/dev/null 2>&1 || die "flock is required for profile config protection"
+  exec {config_lock_fd}>"$home/.codex/config.lock"
+  chmod 600 "$home/.codex/config.lock" 2>/dev/null || true
+  if ! flock -w 5 "$config_lock_fd"; then
+    exec {config_lock_fd}>&-
+    die "timed out waiting for profile config lock: $config"
+  fi
   if [ ! -e "$config" ]; then
     printf "%s\n" "$block" > "$config"
   elif [ -f "$config" ] && ! grep -Eq '^\[mcp_servers\.lean-lsp\]|^[[:space:]]*lean-lsp[[:space:]]*=' "$config"; then
     printf "\n%s\n" "$block" >> "$config"
   fi
   chmod 600 "$config" 2>/dev/null || true
+  flock -u "$config_lock_fd"
+  exec {config_lock_fd}>&-
+}
+
+lean_mcp_configured() {
+  local home="$1" config
+  config="$home/.codex/config.toml"
+  if [ -d "$home/.codex-profile-state" ] && [ ! -L "$home/.codex-profile-state" ]; then
+    config="$home/.codex-profile-state/config.toml"
+  fi
+  [ -f "$config" ] &&
+    grep -Eq '^\[mcp_servers\.lean-lsp\]|^[[:space:]]*lean-lsp[[:space:]]*=' "$config"
+}
+
+find_lean_mcp_runner() {
+  local home="$1" host_home="${2:-${HOME:-}}" runner
+  runner="$home/.local/bin/uvx"
+  if [ -x "$runner" ]; then
+    printf '%s\n' "$runner"
+    return 0
+  fi
+  if [ -n "$host_home" ]; then
+    runner="$host_home/.local/bin/uvx"
+    if [ -x "$runner" ]; then
+      printf '%s\n' "$runner"
+      return 0
+    fi
+  fi
+  command -v uvx 2>/dev/null || return 1
 }
 
 find_lean_project_root() {
@@ -262,35 +319,6 @@ find_lean_project_root() {
   return 1
 }
 
-refresh_lean_mcp_project_path() {
-  local home="$1" start_dir="$2" config project tmp
-  config="$home/.codex/config.toml"
-  [ -f "$config" ] || return 0
-  project="$(find_lean_project_root "$start_dir" 2>/dev/null || true)"
-  [ -n "$project" ] || return 0
-  grep -Eq '^\[mcp_servers\.lean-lsp\.env\][[:space:]]*$' "$config" || return 0
-  grep -Eq '^[[:space:]]*LEAN_PROJECT_PATH[[:space:]]*=' "$config" || return 0
-
-  tmp="$config.tmp.$$"
-  awk -v project="$project" '
-    BEGIN { in_lean_env = 0 }
-    /^[[:space:]]*\[[^]]+\][[:space:]]*$/ {
-      in_lean_env = ($0 ~ /^[[:space:]]*\[mcp_servers\.lean-lsp\.env\][[:space:]]*$/)
-    }
-    in_lean_env && /^[[:space:]]*LEAN_PROJECT_PATH[[:space:]]*=/ {
-      print "LEAN_PROJECT_PATH = \"" project "\""
-      next
-    }
-    { print }
-  ' "$config" > "$tmp"
-  if cmp -s "$config" "$tmp"; then
-    rm -f "$tmp"
-  else
-    mv "$tmp" "$config"
-    chmod 600 "$config" 2>/dev/null || true
-  fi
-}
-
 ensure_profile_scaffold() {
   local home="$1"
   mkdir -p "$home/.codex" "$home/.config" "$home/.cache" \
@@ -299,7 +327,9 @@ ensure_profile_scaffold() {
     "$home/.local" "$home/.local/share" "$home/.local/bin" 2>/dev/null || true
   [ -f "$home/.codex/auth.json" ] && chmod 600 "$home/.codex/auth.json" 2>/dev/null || true
   [ -f "$home/.codex/config.toml" ] && chmod 600 "$home/.codex/config.toml" 2>/dev/null || true
-  ensure_lean_mcp_config "$home"
+  if [ ! -e "$home/.codex-profile-state" ] && [ ! -L "$home/.codex-profile-state" ]; then
+    ensure_lean_mcp_config "$home"
+  fi
 }
 
 ensure_shared_state() {
@@ -308,11 +338,11 @@ ensure_shared_state() {
   for name in sessions archived_sessions shell_snapshots; do
     mkdir -p "$SHARED_CODEX_ROOT/$name"
   done
-  touch "$SHARED_CODEX_ROOT/history.jsonl"
+  touch "$SHARED_CODEX_ROOT/history.jsonl" "$SHARED_CODEX_ROOT/session_index.jsonl"
   chmod 700 "$BUNDLE_ROOT/shared" "$SHARED_CODEX_ROOT" \
     "$SHARED_CODEX_ROOT/sessions" "$SHARED_CODEX_ROOT/archived_sessions" \
     "$SHARED_CODEX_ROOT/shell_snapshots" 2>/dev/null || true
-  chmod 600 "$SHARED_CODEX_ROOT/history.jsonl" 2>/dev/null || true
+  chmod 600 "$SHARED_CODEX_ROOT/history.jsonl" "$SHARED_CODEX_ROOT/session_index.jsonl" 2>/dev/null || true
 }
 
 link_shared_dir() {
@@ -362,8 +392,39 @@ link_shared_history() {
   chmod 600 "$target" 2>/dev/null || true
 }
 
+link_shared_session_index() {
+  local codex_home="$1" mode="${2:-full}" profile_path target rel
+  profile_path="$codex_home/session_index.jsonl"
+  target="$SHARED_CODEX_ROOT/session_index.jsonl"
+  touch "$target"
+
+  if [ -L "$profile_path" ]; then
+    [ "$mode" = fast ] && return 0
+    path_under "$(resolve_path "$profile_path")" "$SHARED_CODEX_ROOT" && return 0
+    die "refusing to replace external symlink: $profile_path -> $(resolve_path "$profile_path")"
+  fi
+  if [ -e "$profile_path" ]; then
+    rm -f "$profile_path"
+  fi
+  rel="$(relative_to_dir "$(dirname "$profile_path")" "$target")"
+  ln -sfn "$rel" "$profile_path"
+  chmod 600 "$target" 2>/dev/null || true
+}
+
 is_shared_database_name() {
-  [[ "$1" =~ ^(state|memories|goals|logs)_[0-9]+\.sqlite$ ]]
+  [[ "$1" =~ ^(state|memories|goals)_[0-9]+\.sqlite$ ]]
+}
+
+ensure_local_logs() {
+  local home="$1" path target
+  for path in "$home/.codex"/logs_*.sqlite; do
+    [ -L "$path" ] || continue
+    target="$(resolve_path "$path")"
+    if path_under "$target" "$SHARED_CODEX_ROOT"; then
+      rm -f "$path"
+      note "detached shared log database; new logs are profile-local: $path"
+    fi
+  done
 }
 
 link_shared_database() {
@@ -412,7 +473,7 @@ ensure_shared_databases() {
   local codex_home="$1" mode="${2:-full}" path name
   local -A seen=()
   for path in "$codex_home"/state_*.sqlite "$codex_home"/memories_*.sqlite \
-    "$codex_home"/goals_*.sqlite "$codex_home"/logs_*.sqlite; do
+    "$codex_home"/goals_*.sqlite; do
     [ -e "$path" ] || continue
     name="${path##*/}"
     [ -z "${seen[$name]+x}" ] || continue
@@ -420,14 +481,14 @@ ensure_shared_databases() {
     link_shared_database "$codex_home" "$name" "$mode"
   done
 
-  for name in state_5.sqlite memories_1.sqlite goals_1.sqlite logs_2.sqlite; do
+  for name in state_5.sqlite memories_1.sqlite goals_1.sqlite; do
     [ -z "${seen[$name]+x}" ] || continue
     seen[$name]=1
     link_shared_database "$codex_home" "$name" "$mode"
   done
 
   for path in "$SHARED_CODEX_ROOT"/state_*.sqlite "$SHARED_CODEX_ROOT"/memories_*.sqlite \
-    "$SHARED_CODEX_ROOT"/goals_*.sqlite "$SHARED_CODEX_ROOT"/logs_*.sqlite; do
+    "$SHARED_CODEX_ROOT"/goals_*.sqlite; do
     [ -e "$path" ] || continue
     name="${path##*/}"
     [ -z "${seen[$name]+x}" ] || continue
@@ -439,6 +500,7 @@ ensure_shared_databases() {
 ensure_shared_memory() {
   local home="$1" mode="${2:-full}" codex_home name
   codex_home="$home/.codex"
+  ensure_local_logs "$home"
   case "$mode" in
     full) reject_escaping_symlinks "$home" ;;
     fast) check_escaping_symlinks "$home" 4 || die "profile contains disallowed top-level symlinks" ;;
@@ -451,6 +513,7 @@ ensure_shared_memory() {
     link_shared_dir "$codex_home" "$name" "$mode"
   done
   link_shared_history "$codex_home" "$mode"
+  link_shared_session_index "$codex_home" "$mode"
   ensure_shared_databases "$codex_home" "$mode"
   case "$mode" in
     full) reject_escaping_symlinks "$home" ;;
@@ -472,7 +535,8 @@ ensure_profile_launcher() {
 }
 
 profile_symlink_target_allowed() {
-  local root="$1" link="$2" target="$3" runtime_root="$4" shared_root="$5" rel name
+  local root="$1" link="$2" target="$3" runtime_root="$4" shared_root="$5"
+  local runtime_cache_root="$6" rel name
   if [ "$link" = "$root/.local/bin/codex" ] && path_under_resolved "$target" "$runtime_root"; then
     return 0
   fi
@@ -480,9 +544,12 @@ profile_symlink_target_allowed() {
   case "$rel" in
     tmp/arg0/codex-arg*/apply_patch|tmp/arg0/codex-arg*/applypatch|\
     tmp/arg0/codex-arg*/codex-execve-wrapper|tmp/arg0/codex-arg*/codex-linux-sandbox)
-      path_under_resolved "$target" "$runtime_root" && return 0
+      if path_under_resolved "$target" "$runtime_root" ||
+        path_under_resolved "$target" "$runtime_cache_root"; then
+        return 0
+      fi
       ;;
-    sessions|archived_sessions|shell_snapshots|history.jsonl)
+    sessions|archived_sessions|shell_snapshots|history.jsonl|session_index.jsonl)
       path_under_resolved "$target" "$shared_root" && return 0
       ;;
     *.sqlite)
@@ -528,14 +595,15 @@ uv_cache_python_link_allowed() {
 }
 
 check_escaping_symlinks() {
-  local root="$1" maxdepth="${2:-}" link target runtime_root shared_root ok=0
+  local root="$1" maxdepth="${2:-}" link target runtime_root shared_root runtime_cache_root ok=0
   root="$(resolve_path "$root")"
   runtime_root="$(resolve_path "$RUNTIME_ROOT")"
   shared_root="$(resolve_path "$SHARED_CODEX_ROOT")"
+  runtime_cache_root="$(resolve_path "${CODEX_RUNTIME_CACHE_ROOT:-/tmp/codex-bundle-runtime-cache-$(id -u)}")"
   if [ -n "$maxdepth" ]; then
     while IFS= read -r link; do
       target="$(resolve_path "$link")"
-      if ! profile_symlink_target_allowed "$root" "$link" "$target" "$runtime_root" "$shared_root"; then
+      if ! profile_symlink_target_allowed "$root" "$link" "$target" "$runtime_root" "$shared_root" "$runtime_cache_root"; then
         echo "escaping symlink: $link -> $target" >&2
         ok=1
       fi
@@ -543,7 +611,7 @@ check_escaping_symlinks() {
   else
     while IFS= read -r link; do
       target="$(resolve_path "$link")"
-      if ! profile_symlink_target_allowed "$root" "$link" "$target" "$runtime_root" "$shared_root"; then
+      if ! profile_symlink_target_allowed "$root" "$link" "$target" "$runtime_root" "$shared_root" "$runtime_cache_root"; then
         echo "escaping symlink: $link -> $target" >&2
         ok=1
       fi
@@ -578,7 +646,7 @@ proxy_env_lines() {
 override_env_lines() {
   env | awk -F= '{
     name=$1; uname=toupper(name)
-    if (uname ~ /^CODEX_(BUNDLE_ROOT|PROFILES_ROOT|ACTIVE_PROFILE_LINK|SHARED_ROOT|REAL_BIN|TZ|ALLOW_PROXY|ALLOW_EXTERNAL_RUNTIME|ALLOW_ENV_OVERRIDES)$/) next
+    if (uname ~ /^CODEX_(BUNDLE_ROOT|PROFILES_ROOT|ACTIVE_PROFILE_LINK|SHARED_ROOT|REAL_BIN|TZ|HISTORY_KEEP_DAYS|HISTORY_STABLE_SECONDS|HISTORY_LOCK_TIMEOUT_SECONDS|HISTORY_DB_TIMEOUT_SECONDS|HISTORY_PREPARE_INTERVAL_SECONDS|AUTO_HISTORY_MAINTENANCE|RUNTIME_CACHE_LOCK_TIMEOUT_SECONDS|RUNTIME_CACHE_ROOT|USE_LOCAL_RUNTIME_CACHE|ALLOW_DUPLICATE_SESSION|ALLOW_DIRECT_PROFILE_RUNTIME|ALLOW_AUTH_IDENTITY_CHANGE|ALLOW_PROFILE_CONFIG_CHANGE|PROFILE_GUARD_POLL_SECONDS|ALLOW_PROXY|ALLOW_EXTERNAL_RUNTIME|ALLOW_ENV_OVERRIDES|HOME|THREAD_ID|SESSION_ID|CI|MANAGED_BY_NPM|MANAGED_PACKAGE_ROOT|PERMISSION_PROFILE|SANDBOX_NETWORK_DISABLED|PROFILE_PRESERVE_MODEL_CONFIG)$/) next
     if (uname ~ /^(OPENAI_|CODEX_|AZURE_OPENAI_|AZURE_|AWS_|GOOGLE_APPLICATION_CREDENTIALS$|GOOGLE_CLOUD_)/) print name"=<set>"
   }'
 }
@@ -591,6 +659,66 @@ require_safe_env() {
   if [ "${CODEX_ALLOW_ENV_OVERRIDES:-0}" != "1" ] && override_env_lines | grep -q .; then
     override_env_lines >&2
     die "OpenAI/Codex/provider environment overrides detected; unset them or set CODEX_ALLOW_ENV_OVERRIDES=1 explicitly"
+  fi
+}
+
+process_environment_has_entry() {
+  local environment_file="$1" expected="$2" entry
+  while IFS= read -r -d '' entry; do
+    if [ "$entry" = "$expected" ]; then
+      return 0
+    fi
+  done < "$environment_file" 2>/dev/null
+  return 1
+}
+
+process_is_codex_runtime() {
+  local pid="$1" executable argument name
+  if [ -r "/proc/$pid/exe" ]; then
+    executable="$(readlink "/proc/$pid/exe" 2>/dev/null || true)"
+    name="${executable##*/}"
+    name="${name% (deleted)}"
+    case "$name" in
+      codex|codex-code-mode-host) return 0 ;;
+    esac
+  fi
+  while IFS= read -r -d '' argument; do
+    name="${argument##*/}"
+    case "$name" in
+      codex|codex-code-mode-host) return 0 ;;
+    esac
+  done < "/proc/$pid/cmdline" 2>/dev/null
+  return 1
+}
+
+direct_profile_runtime_pids() {
+  local home="$1" environment_file pid
+  local expected
+  expected="CODEX_HOME=$home/.codex"
+  for environment_file in /proc/[0-9]*/environ; do
+    [ -r "$environment_file" ] || continue
+    pid="${environment_file#/proc/}"
+    pid="${pid%/environ}"
+    [ "$pid" != "$$" ] || continue
+    process_is_codex_runtime "$pid" || continue
+    if process_environment_has_entry "$environment_file" "$expected"; then
+      printf '%s\n' "$pid"
+    fi
+  done
+}
+
+direct_profile_runtime_guard() {
+  local home="$1" allow pids
+  allow="${CODEX_ALLOW_DIRECT_PROFILE_RUNTIME:-0}"
+  case "$allow" in
+    0) ;;
+    1) return 0 ;;
+    *) die "CODEX_ALLOW_DIRECT_PROFILE_RUNTIME must be 0 or 1" ;;
+  esac
+  pids="$(direct_profile_runtime_pids "$home" | paste -sd, -)"
+  if [ -n "$pids" ]; then
+    die "profile $(basename "$home") still has processes using its persistent CODEX_HOME (PIDs: $pids);" \
+      "exit those old or bypassing Codex processes before launching"
   fi
 }
 
@@ -621,6 +749,7 @@ init_profile() {
   ensure_profile_scaffold "$home"
   ensure_shared_memory "$home"
   ensure_profile_launcher "$home"
+  ensure_trusted_profile_state "$home"
   secure_profile_perms "$home"
   note "created empty profile: $name"
   note "start it with: $BIN_DIR/codex-profile run $name"
@@ -648,6 +777,7 @@ import_profile() {
     reject_shared_symlinks
     ensure_shared_memory "$tmp"
     ensure_profile_launcher "$tmp"
+    ensure_trusted_profile_state "$tmp"
     reject_escaping_symlinks "$tmp"
     reject_shared_symlinks
     secure_profile_perms "$tmp"
@@ -673,25 +803,843 @@ switch_profile() {
   note "home: $(profile_home "$name")"
 }
 
+profile_concurrency_guard() {
+  local home="$1" session_id="" lock_dir lock_file
+  shift
+  if [ "${1:-}" != "resume" ] || [[ ! "${2:-}" =~ ^[0-9a-fA-F-]{36}$ ]]; then
+    return 0
+  fi
+  session_id="${2}"
+  if [ "${CODEX_ALLOW_DUPLICATE_SESSION:-0}" = 1 ]; then
+    return 0
+  fi
+  command -v flock >/dev/null 2>&1 || die "flock is required for duplicate session protection"
+  lock_dir="$home/.codex/run-locks"
+  mkdir -p "$lock_dir"
+  chmod 700 "$lock_dir" 2>/dev/null || true
+  lock_file="$lock_dir/session-$session_id.lock"
+  exec 9>"$lock_file"
+  if ! flock -n 9; then
+    die "session $session_id is already running in profile $(basename "$home"); set CODEX_ALLOW_DUPLICATE_SESSION=1 only if duplicate resume is intentional"
+  fi
+  CODEX_SESSION_LOCKED=1
+}
+
+local_runtime_launcher() {
+  local launcher="$1" version_dir version_name cache_root cache_dir tmp lock_timeout
+  if [ "${CODEX_USE_LOCAL_RUNTIME_CACHE:-1}" = 0 ]; then
+    printf '%s\n' "$launcher"
+    return 0
+  fi
+  version_dir="$(dirname "$(dirname "$launcher")")"
+  version_name="$(basename "$version_dir")"
+  cache_root="${CODEX_RUNTIME_CACHE_ROOT:-/tmp/codex-bundle-runtime-cache-$(id -u)}"
+  cache_dir="$cache_root/$version_name"
+  mkdir -p "$cache_root"
+  chmod 700 "$cache_root" 2>/dev/null || true
+  exec 7>"$cache_root/.cache.lock"
+  lock_timeout="${CODEX_RUNTIME_CACHE_LOCK_TIMEOUT_SECONDS:-30}"
+  [[ "$lock_timeout" =~ ^[0-9]+([.][0-9]+)?$ ]] ||
+    die "CODEX_RUNTIME_CACHE_LOCK_TIMEOUT_SECONDS must be a non-negative number"
+  if ! flock -w "$lock_timeout" 7; then
+    die "timed out waiting ${lock_timeout}s for runtime cache lock: $cache_root/.cache.lock"
+  fi
+  if [ ! -x "$cache_dir/bin/codex" ] || ! cmp -s "$version_dir/MANIFEST.sha256" "$cache_dir/MANIFEST.sha256"; then
+    tmp="$cache_root/.${version_name}.tmp.$$"
+    rm -rf "$tmp"
+    cp -a "$version_dir" "$tmp"
+    rm -rf "$cache_dir"
+    mv "$tmp" "$cache_dir"
+  fi
+  printf '%s\n' "$cache_dir/bin/codex"
+}
+
+toml_string() {
+  local value="$1"
+  case "$value" in
+    *$'\n'*|*$'\r'*) die "cannot encode a newline in a command-line config value" ;;
+  esac
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  printf '"%s"' "$value"
+}
+
+runtime_file_digest() {
+  local target="$1"
+  if [ -f "$target" ] && [ ! -L "$target" ]; then
+    sha256sum -- "$target" | awk '{print $1}'
+  elif [ -e "$target" ] || [ -L "$target" ]; then
+    printf 'unsupported\n'
+  else
+    printf 'missing\n'
+  fi
+}
+
+runtime_home_entry_is_protected() {
+  case "$1" in
+    auth.json|auth.json.*|.auth.json.*|auth.lock|\
+    config.toml|config.toml.*|.config.toml.*|config.lock|\
+    .auth-guard.*|.config-guard.*|.runtime-state.*|runtime-home.lock)
+      return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+runtime_codex_home_root() {
+  local root owner uid
+  uid="$(id -u)"
+  root="/var/tmp/codex-profile-runtime-$uid"
+  [ ! -L "$root" ] || die "runtime-home root must not be a symlink: $root"
+  mkdir -p "$root"
+  [ -d "$root" ] && [ ! -L "$root" ] ||
+    die "runtime-home root must be a real directory: $root"
+  owner="$(stat -c %u -- "$root" 2>/dev/null || printf invalid)"
+  [ "$owner" = "$uid" ] ||
+    die "runtime-home root is owned by uid $owner, expected $uid: $root"
+  chmod 700 "$root" 2>/dev/null ||
+    die "could not secure runtime-home root: $root"
+  printf '%s\n' "$root"
+}
+
+RUNTIME_CODEX_HOME_TO_CLEAN=""
+
+cleanup_runtime_codex_home() {
+  local runtime_home="${1:-}" runtime_root prefix
+  [ -n "$runtime_home" ] || return 0
+  runtime_root="$(runtime_codex_home_root)"
+  prefix="$runtime_root/codex-profile-home."
+  case "$runtime_home" in
+    "$prefix"??????) ;;
+    *)
+      note "refusing to clean unexpected runtime home: $runtime_home"
+      return 1
+      ;;
+  esac
+  if [ -e "$runtime_home" ] || [ -L "$runtime_home" ]; then
+    if [ ! -d "$runtime_home" ] || [ -L "$runtime_home" ]; then
+      note "refusing to clean non-directory runtime home: $runtime_home"
+      return 1
+    fi
+    rm -rf -- "$runtime_home"
+  fi
+}
+
+cleanup_runtime_codex_home_on_exit() {
+  local runtime_home="$RUNTIME_CODEX_HOME_TO_CLEAN"
+  RUNTIME_CODEX_HOME_TO_CLEAN=""
+  cleanup_runtime_codex_home "$runtime_home" || true
+}
+
+prepare_runtime_codex_home() {
+  local home="$1" source runtime_home entry name trusted_state trusted_value marker
+  local state_lock_fd runtime_root
+  source="$home/.codex"
+  trusted_state="$home/.codex-profile-state"
+  [ -d "$source" ] && [ ! -L "$source" ] ||
+    die "profile Codex home must be a real directory: $source"
+  runtime_root="$(runtime_codex_home_root)"
+  runtime_home="$(mktemp -d "$runtime_root/codex-profile-home.XXXXXX")"
+  chmod 700 "$runtime_home" 2>/dev/null || true
+  while IFS= read -r -d '' entry; do
+    name="${entry##*/}"
+    runtime_home_entry_is_protected "$name" && continue
+    if ! ln -s -- "$entry" "$runtime_home/$name"; then
+      cleanup_runtime_codex_home "$runtime_home" || true
+      die "could not link runtime state entry: $entry"
+    fi
+  done < <(find "$source" -mindepth 1 -maxdepth 1 -print0)
+
+  exec {state_lock_fd}>"$home/.codex-profile-state.lock"
+  if ! flock -w 5 "$state_lock_fd"; then
+    exec {state_lock_fd}>&-
+    cleanup_runtime_codex_home "$runtime_home" || true
+    die "timed out reading trusted profile state"
+  fi
+  trusted_profile_state_validate_unlocked "$home"
+  for name in auth.json config.toml; do
+    trusted_value="$trusted_state/$name"
+    marker="$trusted_state/$name.missing"
+    if [ -f "$trusted_value" ] && [ ! -L "$trusted_value" ]; then
+      if ! cp -p -- "$trusted_value" "$runtime_home/$name"; then
+        flock -u "$state_lock_fd" 2>/dev/null || true
+        exec {state_lock_fd}>&-
+        cleanup_runtime_codex_home "$runtime_home" || true
+        die "could not copy trusted $name into isolated runtime home"
+      fi
+      chmod 600 "$runtime_home/$name" 2>/dev/null || true
+    elif [ ! -f "$marker" ] || [ -L "$marker" ]; then
+      flock -u "$state_lock_fd" 2>/dev/null || true
+      exec {state_lock_fd}>&-
+      cleanup_runtime_codex_home "$runtime_home" || true
+      die "trusted $name state changed while preparing runtime home"
+    fi
+  done
+  flock -u "$state_lock_fd" 2>/dev/null || true
+  exec {state_lock_fd}>&-
+  printf '%s\n' "$runtime_home"
+}
+
+launch_codex_process() {
+  local launcher="$1" lean_project="$2" override
+  local -a config_args=()
+  shift 2
+  if [ -n "$lean_project" ]; then
+    override="mcp_servers.lean-lsp.env.LEAN_PROJECT_PATH=$(toml_string "$lean_project")"
+    config_args=(-c "$override")
+  fi
+  if [ "${CODEX_SESSION_LOCKED:-0}" = 1 ]; then
+    "$launcher" "${config_args[@]}" "$@" 9>&-
+  else
+    "$launcher" "${config_args[@]}" "$@"
+  fi
+}
+
+restore_guarded_file() {
+  local snapshot="$1" target="$2" mode="$3" tmp
+  tmp="$(mktemp "$target.restore.XXXXXX")" || return 1
+  if ! cp -p -- "$snapshot" "$tmp"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  chmod "$mode" "$tmp" 2>/dev/null || true
+  if ! mv -f -- "$tmp" "$target"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+}
+
+trusted_profile_state_validate_unlocked() {
+  local home="$1" state name value marker present absent version
+  state="$home/.codex-profile-state"
+  [ -d "$state" ] && [ ! -L "$state" ] ||
+    die "trusted profile state must be a real directory: $state"
+  [ -f "$state/version" ] && [ ! -L "$state/version" ] ||
+    die "trusted profile state version is missing or unsafe: $state/version"
+  version="$(tr -d '\n' < "$state/version")"
+  [ "$version" = 1 ] || die "unsupported trusted profile state version: $version"
+  for name in auth.json config.toml; do
+    value="$state/$name"
+    marker="$state/$name.missing"
+    present=0
+    absent=0
+    if [ -e "$value" ] || [ -L "$value" ]; then
+      [ -f "$value" ] && [ ! -L "$value" ] ||
+        die "trusted $name must be a regular file: $value"
+      present=1
+    fi
+    if [ -e "$marker" ] || [ -L "$marker" ]; then
+      [ -f "$marker" ] && [ ! -L "$marker" ] ||
+        die "trusted $name missing marker must be a regular file: $marker"
+      absent=1
+    fi
+    [ $((present + absent)) -eq 1 ] ||
+      die "trusted $name state is inconsistent under $state"
+  done
+}
+
+sync_profile_file_from_trusted_unlocked() {
+  local home="$1" name="$2" state value marker target lock
+  state="$home/.codex-profile-state"
+  value="$state/$name"
+  marker="$state/$name.missing"
+  target="$home/.codex/$name"
+  case "$name" in
+    auth.json) lock="$home/.codex/auth.lock" ;;
+    config.toml) lock="$home/.codex/config.lock" ;;
+    *) return 1 ;;
+  esac
+  if [ -f "$value" ] && [ ! -L "$value" ]; then
+    if [ -f "$target" ] && [ ! -L "$target" ] && cmp -s -- "$value" "$target"; then
+      chmod 600 "$target" 2>/dev/null || true
+      return 0
+    fi
+    persist_runtime_file "$value" "$target" "$lock" 600
+  elif [ -f "$marker" ] && [ ! -L "$marker" ]; then
+    if [ ! -e "$target" ] && [ ! -L "$target" ]; then
+      return 0
+    fi
+    remove_runtime_profile_file "$target" "$lock"
+  else
+    return 1
+  fi
+}
+
+sync_profile_from_trusted_unlocked() {
+  local home="$1" name result=0
+  for name in auth.json config.toml; do
+    if ! sync_profile_file_from_trusted_unlocked "$home" "$name"; then
+      note "could not mirror trusted $name into the persistent profile; runtime isolation remains active"
+      result=1
+    fi
+  done
+  return "$result"
+}
+
+ensure_trusted_profile_state() {
+  local home="$1" state lock staging source name state_lock_fd
+  state="$home/.codex-profile-state"
+  lock="$home/.codex-profile-state.lock"
+  [ -d "$home/.codex" ] && [ ! -L "$home/.codex" ] ||
+    die "profile Codex home must be a real directory: $home/.codex"
+  command -v flock >/dev/null 2>&1 ||
+    die "flock is required for trusted profile state"
+  exec {state_lock_fd}>"$lock"
+  chmod 600 "$lock" 2>/dev/null || true
+  if ! flock -w 5 "$state_lock_fd"; then
+    exec {state_lock_fd}>&-
+    die "timed out waiting for trusted profile state lock: $lock"
+  fi
+  if [ -L "$state" ] || { [ -e "$state" ] && [ ! -d "$state" ]; }; then
+    die "trusted profile state path is unsafe: $state"
+  fi
+  if [ ! -e "$state" ]; then
+    staging="$(mktemp -d "$home/.codex-profile-state.tmp.XXXXXX")"
+    chmod 700 "$staging" 2>/dev/null || true
+    for name in auth.json config.toml; do
+      source="$home/.codex/$name"
+      if [ -e "$source" ] || [ -L "$source" ]; then
+        if [ ! -f "$source" ] || [ -L "$source" ] ||
+          ! cp -p -- "$source" "$staging/$name"; then
+          rm -rf -- "$staging"
+          die "could not initialize trusted $name from $source"
+        fi
+        chmod 600 "$staging/$name" 2>/dev/null || true
+      else
+        touch "$staging/$name.missing"
+        chmod 600 "$staging/$name.missing" 2>/dev/null || true
+      fi
+    done
+    printf '1\n' > "$staging/version"
+    chmod 600 "$staging/version" 2>/dev/null || true
+    if ! mv -T -- "$staging" "$state"; then
+      rm -rf -- "$staging"
+      die "could not install trusted profile state: $state"
+    fi
+    note "initialized trusted auth/config state for profile $(basename "$home")"
+  fi
+  trusted_profile_state_validate_unlocked "$home"
+  if ! sync_profile_from_trusted_unlocked "$home"; then
+    note "the trusted profile state is valid, but its persistent mirror is currently contested"
+  fi
+  flock -u "$state_lock_fd" 2>/dev/null || true
+  exec {state_lock_fd}>&-
+}
+
+persist_trusted_profile_file() {
+  local home="$1" name="$2" source="$3" mode="$4"
+  local state value marker lock state_lock_fd result=0
+  case "$name" in
+    auth.json|config.toml) ;;
+    *) return 1 ;;
+  esac
+  [ -f "$source" ] && [ ! -L "$source" ] || return 1
+  state="$home/.codex-profile-state"
+  value="$state/$name"
+  marker="$state/$name.missing"
+  lock="$home/.codex-profile-state.lock"
+  exec {state_lock_fd}>"$lock" || return 1
+  chmod 600 "$lock" 2>/dev/null || true
+  if ! flock -w 5 "$state_lock_fd"; then
+    exec {state_lock_fd}>&-
+    return 1
+  fi
+  trusted_profile_state_validate_unlocked "$home"
+  if ! restore_guarded_file "$source" "$value" "$mode" ||
+    ! rm -f -- "$marker"; then
+    result=1
+  elif ! sync_profile_file_from_trusted_unlocked "$home" "$name"; then
+    note "updated trusted $name, but could not mirror it into the persistent profile"
+  fi
+  flock -u "$state_lock_fd" 2>/dev/null || true
+  exec {state_lock_fd}>&-
+  return "$result"
+}
+
+remove_trusted_profile_file() {
+  local home="$1" name="$2" state value marker lock temporary state_lock_fd result=0
+  case "$name" in
+    auth.json|config.toml) ;;
+    *) return 1 ;;
+  esac
+  state="$home/.codex-profile-state"
+  value="$state/$name"
+  marker="$state/$name.missing"
+  lock="$home/.codex-profile-state.lock"
+  exec {state_lock_fd}>"$lock" || return 1
+  chmod 600 "$lock" 2>/dev/null || true
+  if ! flock -w 5 "$state_lock_fd"; then
+    exec {state_lock_fd}>&-
+    return 1
+  fi
+  trusted_profile_state_validate_unlocked "$home"
+  temporary="$(mktemp "$state/.$name.missing.XXXXXX")" || result=1
+  if [ "$result" -eq 0 ]; then
+    chmod 600 "$temporary" 2>/dev/null || true
+    if ! rm -f -- "$value" || ! mv -f -- "$temporary" "$marker"; then
+      rm -f -- "$temporary"
+      result=1
+    elif ! sync_profile_file_from_trusted_unlocked "$home" "$name"; then
+      note "recorded trusted $name removal, but could not mirror it into the persistent profile"
+    fi
+  fi
+  flock -u "$state_lock_fd" 2>/dev/null || true
+  exec {state_lock_fd}>&-
+  return "$result"
+}
+
+persist_runtime_file() {
+  local source="$1" target="$2" lock="$3" mode="$4" lock_fd result=0
+  [ -f "$source" ] && [ ! -L "$source" ] || return 1
+  exec {lock_fd}>"$lock" || return 1
+  chmod 600 "$lock" 2>/dev/null || true
+  if ! flock -w 5 "$lock_fd"; then
+    exec {lock_fd}>&-
+    return 1
+  fi
+  restore_guarded_file "$source" "$target" "$mode" || result=1
+  flock -u "$lock_fd" 2>/dev/null || true
+  exec {lock_fd}>&-
+  return "$result"
+}
+
+remove_runtime_profile_file() {
+  local target="$1" lock="$2" lock_fd result=0
+  exec {lock_fd}>"$lock" || return 1
+  chmod 600 "$lock" 2>/dev/null || true
+  if ! flock -w 5 "$lock_fd"; then
+    exec {lock_fd}>&-
+    return 1
+  fi
+  rm -f -- "$target" || result=1
+  flock -u "$lock_fd" 2>/dev/null || true
+  exec {lock_fd}>&-
+  return "$result"
+}
+
+merge_new_runtime_state_entry() {
+  local entry="$1" target="$2" source_root="$3" holder
+  holder="$(mktemp -d "$source_root/.runtime-state.XXXXXX")" || return 1
+  chmod 700 "$holder" 2>/dev/null || true
+  if ! cp -a -- "$entry" "$holder/value"; then
+    rm -rf -- "$holder"
+    return 1
+  fi
+  if [ -e "$target" ] || [ -L "$target" ]; then
+    rm -rf -- "$holder"
+    return 0
+  fi
+  if ! mv -T -- "$holder/value" "$target"; then
+    rm -rf -- "$holder"
+    return 1
+  fi
+  rmdir -- "$holder" 2>/dev/null || true
+}
+
+merge_runtime_codex_state() {
+  local home="$1" runtime_home="$2" source entry name target mode lock_fd result=0
+  source="$home/.codex"
+  exec {lock_fd}>"$source/runtime-home.lock" || return 1
+  chmod 600 "$source/runtime-home.lock" 2>/dev/null || true
+  if ! flock -w 5 "$lock_fd"; then
+    exec {lock_fd}>&-
+    return 1
+  fi
+  while IFS= read -r -d '' entry; do
+    name="${entry##*/}"
+    runtime_home_entry_is_protected "$name" && continue
+    target="$source/$name"
+    if [ -L "$entry" ] && [ "$(readlink "$entry")" = "$target" ]; then
+      continue
+    fi
+    if [ ! -e "$target" ] && [ ! -L "$target" ]; then
+      if [ -L "$entry" ]; then
+        note "discarded unsafe new runtime symlink: $name"
+      elif ! merge_new_runtime_state_entry "$entry" "$target" "$source"; then
+        note "could not persist new runtime state entry: $name"
+        result=1
+      fi
+    elif [ -f "$entry" ] && [ ! -L "$entry" ] &&
+      [ -f "$target" ] && [ ! -L "$target" ]; then
+      mode="$(stat -c '%a' -- "$entry" 2>/dev/null || printf 600)"
+      if ! restore_guarded_file "$entry" "$target" "$mode"; then
+        note "could not persist replaced runtime state file: $name"
+        result=1
+      fi
+    else
+      note "discarded incompatible runtime replacement of profile state: $name"
+    fi
+  done < <(find "$runtime_home" -mindepth 1 -maxdepth 1 -print0)
+  flock -u "$lock_fd" 2>/dev/null || true
+  exec {lock_fd}>&-
+  return "$result"
+}
+
+finalize_runtime_codex_home() {
+  local home="$1" runtime_home="$2" command="$3" auth_before="$4"
+  local expected_auth_identity="$5" config_before="$6"
+  local trusted_auth="$home/.codex-profile-state/auth.json"
+  local runtime_auth="$runtime_home/auth.json" runtime_config="$runtime_home/config.toml"
+  local auth_after config_after current_auth current_digest tool launch_kind
+  local allow_auth allow_config result=0
+  tool="$BIN_DIR/codex-history"
+  allow_auth="${CODEX_ALLOW_AUTH_IDENTITY_CHANGE:-0}"
+  allow_config="${CODEX_ALLOW_PROFILE_CONFIG_CHANGE:-0}"
+  launch_kind="$command"
+  [ -n "$launch_kind" ] || launch_kind=interactive
+
+  if ! merge_runtime_codex_state "$home" "$runtime_home"; then
+    result=1
+  fi
+
+  config_after="$(runtime_file_digest "$runtime_config")"
+  if [ "$config_after" != "$config_before" ]; then
+    if [ "$allow_config" = 1 ] || [ "$config_before" = missing ]; then
+      if [ "$config_after" = missing ]; then
+        if ! remove_trusted_profile_file "$home" config.toml; then
+          note "could not persist trusted config removal"
+          result=1
+        fi
+      elif [ "$config_after" = unsupported ] ||
+        ! persist_trusted_profile_file "$home" config.toml "$runtime_config" 600; then
+        note "could not persist trusted config update"
+        result=1
+      fi
+    else
+      note "discarded isolated config rewrite during $launch_kind launch"
+      note "set CODEX_ALLOW_PROFILE_CONFIG_CHANGE=1 only for an intentional config change"
+    fi
+  fi
+
+  auth_after="$(runtime_file_digest "$runtime_auth")"
+  if [ "$auth_after" != "$auth_before" ]; then
+    if [ "$allow_auth" = 1 ] || [ "$command" = login ] ||
+      [ "$command" = logout ] || [ "$auth_before" = missing ]; then
+      if [ "$auth_after" = missing ]; then
+        if ! remove_trusted_profile_file "$home" auth.json; then
+          note "could not persist trusted auth removal"
+          result=1
+        fi
+      elif [ "$auth_after" = unsupported ] ||
+        ! "$tool" auth-identity --auth-file "$runtime_auth" >/dev/null 2>&1 ||
+        ! persist_trusted_profile_file "$home" auth.json "$runtime_auth" 600; then
+        note "could not persist trusted auth update"
+        result=1
+      fi
+    elif [ "$auth_after" = missing ] || [ "$auth_after" = unsupported ]; then
+      note "discarded isolated auth removal or invalid replacement during $launch_kind launch"
+    else
+      current_auth="$("$tool" auth-identity --auth-file "$runtime_auth" 2>/dev/null || printf invalid)"
+      if [ "$current_auth" != "$expected_auth_identity" ]; then
+        note "discarded isolated auth identity change during $launch_kind launch"
+        note "use login/logout or CODEX_ALLOW_AUTH_IDENTITY_CHANGE=1 to change this profile's account"
+      else
+        current_digest="$(runtime_file_digest "$trusted_auth")"
+        if [ "$current_digest" != "$auth_before" ] &&
+          [ "$("$tool" auth-identity --auth-file "$trusted_auth" 2>/dev/null || printf invalid)" = "$expected_auth_identity" ]; then
+          note "kept a newer trusted same-account auth refresh from another profile process"
+        elif ! persist_trusted_profile_file "$home" auth.json "$runtime_auth" 600; then
+          note "could not persist trusted same-account auth refresh"
+          result=1
+        fi
+      fi
+    fi
+  fi
+  ensure_trusted_profile_state "$home"
+  return "$result"
+}
+
+guard_config_once() {
+  local home="$1" backup="$2" config lock_fd result=0
+  config="$home/.codex/config.toml"
+  exec {lock_fd}>"$home/.codex/config.lock" || return 20
+  chmod 600 "$home/.codex/config.lock" 2>/dev/null || true
+  if ! flock -w 1 "$lock_fd"; then
+    exec {lock_fd}>&-
+    return 20
+  fi
+  if [ -f "$config" ] && [ ! -L "$config" ] && cmp -s -- "$backup" "$config"; then
+    result=0
+  elif restore_guarded_file "$backup" "$config" 600; then
+    result=10
+  else
+    result=20
+  fi
+  flock -u "$lock_fd" 2>/dev/null || true
+  exec {lock_fd}>&-
+  return "$result"
+}
+
+guard_auth_once() {
+  local home="$1" backup="$2" expected="$3" tool="$4"
+  local auth current next lock_fd result=0
+  auth="$home/.codex/auth.json"
+  exec {lock_fd}>"$home/.codex/auth.lock" || return 20
+  chmod 600 "$home/.codex/auth.lock" 2>/dev/null || true
+  if ! flock -w 1 "$lock_fd"; then
+    exec {lock_fd}>&-
+    return 20
+  fi
+  current="invalid"
+  if [ -f "$auth" ] && [ ! -L "$auth" ]; then
+    current="$("$tool" auth-identity --auth-file "$auth" 2>/dev/null || printf invalid)"
+  fi
+  if [ "$current" = "$expected" ]; then
+    if ! cmp -s -- "$backup" "$auth"; then
+      next="$backup.next"
+      if cp -p -- "$auth" "$next" && chmod 600 "$next" 2>/dev/null &&
+        mv -f -- "$next" "$backup"; then
+        result=0
+      else
+        rm -f -- "$next"
+        result=20
+      fi
+    fi
+  elif restore_guarded_file "$backup" "$auth" 600; then
+    result=10
+  else
+    result=20
+  fi
+  flock -u "$lock_fd" 2>/dev/null || true
+  exec {lock_fd}>&-
+  return "$result"
+}
+
+guard_profile_once() {
+  local home="$1" auth_backup="$2" auth_identity="$3"
+  local config_backup="$4" command="$5" tool="$BIN_DIR/codex-history" result
+  if [ -n "$config_backup" ]; then
+    if guard_config_once "$home" "$config_backup"; then
+      :
+    else
+      result=$?
+      if [ "$result" -eq 10 ]; then
+        note "blocked profile config overwrite during ${command:-interactive} launch"
+        note "set CODEX_ALLOW_PROFILE_CONFIG_CHANGE=1 only for an intentional config change"
+      else
+        note "could not verify profile config guard; it will retry"
+      fi
+    fi
+  fi
+  if [ -n "$auth_backup" ]; then
+    if guard_auth_once "$home" "$auth_backup" "$auth_identity" "$tool"; then
+      :
+    else
+      result=$?
+      if [ "$result" -eq 10 ]; then
+        note "restored profile auth after account identity changed during ${command:-interactive} launch"
+        note "use login/logout or CODEX_ALLOW_AUTH_IDENTITY_CHANGE=1 to change this profile's account"
+      else
+        note "could not verify profile auth guard; it will retry"
+      fi
+    fi
+  fi
+  return 0
+}
+
+guarded_file_signature() {
+  local target="$1"
+  if [ -e "$target" ] || [ -L "$target" ]; then
+    stat -c '%d:%i:%s:%y:%z:%F' -- "$target" 2>/dev/null || printf 'unreadable\n'
+  else
+    printf 'missing\n'
+  fi
+}
+
+cleanup_profile_guard() {
+  local guard_dir="$1" auth_backup="$2" config_backup="$3"
+  if [ -n "$auth_backup" ]; then
+    rm -f -- "$auth_backup" "$auth_backup.next"
+  fi
+  if [ -n "$config_backup" ]; then
+    rm -f -- "$config_backup"
+  fi
+  rmdir -- "$guard_dir" 2>/dev/null || true
+}
+
+watch_profile_guard() {
+  local owner_pid="$1" poll="$2" home="$3" auth_backup="$4"
+  local auth_identity="$5" config_backup="$6" command="$7" guard_dir="$8"
+  local auth="$home/.codex/auth.json" config="$home/.codex/config.toml"
+  local auth_signature="" config_signature="" current_auth current_config
+  [ -z "$auth_backup" ] || auth_signature="$(guarded_file_signature "$auth")"
+  [ -z "$config_backup" ] || config_signature="$(guarded_file_signature "$config")"
+  while kill -0 "$owner_pid" 2>/dev/null; do
+    sleep "$poll" || break
+    current_auth="$auth_signature"
+    current_config="$config_signature"
+    [ -z "$auth_backup" ] || current_auth="$(guarded_file_signature "$auth")"
+    [ -z "$config_backup" ] || current_config="$(guarded_file_signature "$config")"
+    if [ "$current_auth" != "$auth_signature" ] ||
+      [ "$current_config" != "$config_signature" ]; then
+      guard_profile_once "$home" "$auth_backup" "$auth_identity" \
+        "$config_backup" "$command"
+      [ -z "$auth_backup" ] || auth_signature="$(guarded_file_signature "$auth")"
+      [ -z "$config_backup" ] || config_signature="$(guarded_file_signature "$config")"
+    fi
+  done
+  guard_profile_once "$home" "$auth_backup" "$auth_identity" \
+    "$config_backup" "$command"
+  cleanup_profile_guard "$guard_dir" "$auth_backup" "$config_backup"
+}
+
+run_launcher_with_profile_guard() {
+  local home="$1" launcher="$2" lean_project="$3" runtime_home="$4" command="${5:-}"
+  local auth config tool poll allow_auth allow_config protect_auth=1 protect_config=1
+  local guard_dir auth_backup="" config_backup="" before="" status watcher_pid
+  shift 4
+  auth="$runtime_home/auth.json"
+  config="$runtime_home/config.toml"
+  tool="$BIN_DIR/codex-history"
+  poll="${CODEX_PROFILE_GUARD_POLL_SECONDS:-0.5}"
+  allow_auth="${CODEX_ALLOW_AUTH_IDENTITY_CHANGE:-0}"
+  allow_config="${CODEX_ALLOW_PROFILE_CONFIG_CHANGE:-0}"
+  [[ "$poll" =~ ^[0-9]+([.][0-9]+)?$ ]] && [[ "$poll" =~ [1-9] ]] ||
+    die "CODEX_PROFILE_GUARD_POLL_SECONDS must be a positive number"
+  case "$allow_auth" in
+    0|1) ;;
+    *) die "CODEX_ALLOW_AUTH_IDENTITY_CHANGE must be 0 or 1" ;;
+  esac
+  case "$allow_config" in
+    0|1) ;;
+    *) die "CODEX_ALLOW_PROFILE_CONFIG_CHANGE must be 0 or 1" ;;
+  esac
+  if [ "$allow_auth" = 1 ] || [ "$command" = login ] ||
+    [ "$command" = logout ] || [ ! -e "$auth" ]; then
+    protect_auth=0
+  fi
+  if [ "$allow_config" = 1 ] || [ ! -e "$config" ]; then
+    protect_config=0
+  fi
+  if [ "$protect_auth" -eq 0 ] && [ "$protect_config" -eq 0 ]; then
+    set +e
+    launch_codex_process "$launcher" "$lean_project" "$@"
+    status=$?
+    set -e
+    return "$status"
+  fi
+  if [ "$protect_auth" -eq 1 ]; then
+    [ -f "$auth" ] && [ ! -L "$auth" ] ||
+      die "isolated auth path must be a regular file: $auth"
+    [ -x "$tool" ] || die "auth identity tool is missing or not executable: $tool"
+    before="$("$tool" auth-identity --auth-file "$auth")"
+  fi
+  if [ "$protect_config" -eq 1 ]; then
+    [ -f "$config" ] && [ ! -L "$config" ] ||
+      die "isolated config path must be a regular file: $config"
+  fi
+  guard_dir="$(mktemp -d "/tmp/codex-profile-guard.$(id -u).XXXXXX")"
+  chmod 700 "$guard_dir" 2>/dev/null || true
+  if [ "$protect_auth" -eq 1 ]; then
+    auth_backup="$guard_dir/auth.json"
+    cp -p -- "$auth" "$auth_backup"
+    chmod 600 "$auth_backup" 2>/dev/null || true
+  fi
+  if [ "$protect_config" -eq 1 ]; then
+    config_backup="$guard_dir/config.toml"
+    cp -p -- "$config" "$config_backup"
+    chmod 600 "$config_backup" 2>/dev/null || true
+  fi
+
+  watch_profile_guard "$$" "$poll" "$home" "$auth_backup" "$before" \
+    "$config_backup" "$command" "$guard_dir" 9>&- &
+  watcher_pid=$!
+  set +e
+  launch_codex_process "$launcher" "$lean_project" "$@"
+  status=$?
+  set -e
+  kill "$watcher_pid" 2>/dev/null || true
+  set +e
+  wait "$watcher_pid" 2>/dev/null
+  set -e
+  guard_profile_once "$home" "$auth_backup" "$before" "$config_backup" "$command"
+  cleanup_profile_guard "$guard_dir" "$auth_backup" "$config_backup"
+  return "$status"
+}
+
 run_codex() {
-  local home="$1" launcher tz host_home="${HOME:-}"
+  local home="$1" launcher tz host_home="${HOME:-}" lean_runner lean_project log_dir log_key runtime_path
+  local runtime_codex_home runtime_auth_before runtime_config_before
+  local expected_auth_identity="" command status finalize_status cleanup_status
   shift
   launcher="$(resolve_launcher)"
   tz="${CODEX_TZ:-$DEFAULT_TZ}"
   require_safe_env
+  launcher="$(local_runtime_launcher "$launcher")"
   ensure_shared_memory "$home" fast
   ensure_profile_launcher "$home"
-  refresh_lean_mcp_project_path "$home" "$PWD"
+  ensure_trusted_profile_state "$home"
   reject_shared_symlinks
+  direct_profile_runtime_guard "$home"
+  lean_project=""
+  if lean_mcp_configured "$home"; then
+    lean_project="$(find_lean_project_root "$PWD" 2>/dev/null || true)"
+    if ! lean_runner="$(find_lean_mcp_runner "$home" "$host_home")"; then
+      note "lean-lsp MCP requires uvx, but none is executable; install uv before restarting Codex"
+    fi
+  fi
 
   export HOME="$home"
-  export CODEX_HOME="$home/.codex"
+  export CODEX_SHARED_SESSIONS_ROOT="$SHARED_CODEX_ROOT/sessions"
+  log_dir="$home/.codex/log-dbs"
+  mkdir -p "$log_dir"
+  chmod 700 "$log_dir" 2>/dev/null || true
+  if [ "${1:-}" = "resume" ] && [[ "${2:-}" =~ ^[0-9a-fA-F-]{36}$ ]]; then
+    log_key="session-${2}"
+  else
+    log_key="process-${HOSTNAME:-host}-$$-$(date +%s%N)"
+  fi
+  export CODEX_LOG_DB_PATH="$log_dir/logs_2-$log_key.sqlite"
+  export CODEX_DISABLE_STARTUP_PLUGIN_SYNC=1
   export XDG_CONFIG_HOME="$home/.config"
   export XDG_CACHE_HOME="$home/.cache"
   export XDG_DATA_HOME="$home/.local/share"
   export TZ="$tz"
-  export PATH="$BIN_DIR:$home/.local/bin:${host_home:+$host_home/.local/bin:}$PATH"
-  exec "$launcher" "$@"
+  runtime_path="$(dirname "$(dirname "$launcher")")/codex-path"
+  [ -x "$runtime_path/rg" ] || runtime_path="$(runtime_version_dir)/codex-path"
+  export PATH="$BIN_DIR:$runtime_path:$home/.local/bin:${host_home:+$host_home/.local/bin:}$PATH"
+  # A launcher invoked from an existing Codex session inherits these markers.
+  # They belong to the parent session, not to the profile being launched.
+  unset CODEX_THREAD_ID CODEX_SESSION_ID CODEX_CI
+  case "${CODEX_ALLOW_PROFILE_CONFIG_CHANGE:-0}" in
+    0) export CODEX_PROFILE_PRESERVE_MODEL_CONFIG=1 ;;
+    1) unset CODEX_PROFILE_PRESERVE_MODEL_CONFIG ;;
+    *) die "CODEX_ALLOW_PROFILE_CONFIG_CHANGE must be 0 or 1" ;;
+  esac
+  profile_concurrency_guard "$home" "$@"
+  command="${1:-}"
+  runtime_codex_home="$(prepare_runtime_codex_home "$home")"
+  RUNTIME_CODEX_HOME_TO_CLEAN="$runtime_codex_home"
+  trap cleanup_runtime_codex_home_on_exit EXIT
+  runtime_auth_before="$(runtime_file_digest "$runtime_codex_home/auth.json")"
+  runtime_config_before="$(runtime_file_digest "$runtime_codex_home/config.toml")"
+  if [ "$runtime_auth_before" != missing ]; then
+    if [ "$runtime_auth_before" = unsupported ]; then
+      die "isolated runtime auth is not a regular file"
+    fi
+    expected_auth_identity="$("$BIN_DIR/codex-history" auth-identity \
+      --auth-file "$runtime_codex_home/auth.json")" || die "profile auth is invalid"
+  fi
+  export CODEX_HOME="$runtime_codex_home"
+  set +e
+  run_launcher_with_profile_guard "$home" "$launcher" "$lean_project" \
+    "$runtime_codex_home" "$@"
+  status=$?
+  finalize_runtime_codex_home "$home" "$runtime_codex_home" "$command" \
+    "$runtime_auth_before" "$expected_auth_identity" "$runtime_config_before"
+  finalize_status=$?
+  cleanup_runtime_codex_home "$runtime_codex_home"
+  cleanup_status=$?
+  if [ "$cleanup_status" -eq 0 ]; then
+    RUNTIME_CODEX_HOME_TO_CLEAN=""
+  fi
+  set -e
+  if [ "$status" -eq 0 ] && [ "$finalize_status" -ne 0 ]; then
+    status="$finalize_status"
+  fi
+  if [ "$status" -eq 0 ] && [ "$cleanup_status" -ne 0 ]; then
+    status="$cleanup_status"
+  fi
+  return "$status"
 }
 
 run_profile() {
@@ -707,17 +1655,89 @@ run_profile() {
   run_codex "$home" "$@"
 }
 
+ensure_recent_history_visible() {
+  local home="$1"
+  local tool="$BIN_DIR/codex-history"
+  local keep_days="${CODEX_HISTORY_KEEP_DAYS:-3}"
+  local stable_seconds="${CODEX_HISTORY_STABLE_SECONDS:-0}"
+  local lock_timeout="${CODEX_HISTORY_LOCK_TIMEOUT_SECONDS:-10}"
+  local interval="${CODEX_HISTORY_PREPARE_INTERVAL_SECONDS:-60}"
+  local auto_maintenance="${CODEX_AUTO_HISTORY_MAINTENANCE:-0}"
+  local marker="$SHARED_CODEX_ROOT/.resume-prepared"
+  local now modified history_launcher
+  case "$auto_maintenance" in
+    0) return 0 ;;
+    1) ;;
+    *) die "CODEX_AUTO_HISTORY_MAINTENANCE must be 0 or 1" ;;
+  esac
+  [ -x "$tool" ] || die "history tool is missing or not executable: $tool"
+  [[ "$keep_days" =~ ^[0-9]+$ ]] || die "CODEX_HISTORY_KEEP_DAYS must be a non-negative integer"
+  [[ "$stable_seconds" =~ ^[0-9]+$ ]] || die "CODEX_HISTORY_STABLE_SECONDS must be a non-negative integer"
+  [[ "$interval" =~ ^[0-9]+$ ]] || die "CODEX_HISTORY_PREPARE_INTERVAL_SECONDS must be a non-negative integer"
+  [[ "$lock_timeout" =~ ^[0-9]+([.][0-9]+)?$ ]] ||
+    die "CODEX_HISTORY_LOCK_TIMEOUT_SECONDS must be a non-negative number"
+  if [ -f "$marker" ] && [ "$interval" -gt 0 ]; then
+    now="$(date +%s)"
+    modified="$(stat -c %Y "$marker" 2>/dev/null || echo 0)"
+    if [[ "$modified" =~ ^[0-9]+$ ]] && [ "$modified" -le "$now" ] && [ $((now - modified)) -lt "$interval" ]; then
+      return 0
+    fi
+  fi
+  history_launcher="$(local_runtime_launcher "$(resolve_launcher)")"
+  CODEX_HISTORY_REAL_BIN="$history_launcher" "$tool" sync-history \
+    --profile-home "$home" --stable-seconds "$stable_seconds" \
+    --lock-timeout "$lock_timeout" --quiet
+  [ -s "$SHARED_CODEX_ROOT/state_5.sqlite" ] || return 0
+  "$tool" ensure-visible --keep-days "$keep_days" \
+    --lock-timeout "$lock_timeout" --quiet
+  touch "$marker"
+  chmod 600 "$marker" 2>/dev/null || true
+}
+
 resume_profile() {
-  local name="${1:-}"
+  local name="${1:-}" home
   if [ -n "$name" ] && [ "$name" != "--" ]; then
     shift
     [ "${1:-}" = "--" ] && shift
-    run_profile "$name" -- resume "$@"
+    home="$(profile_home "$name")"
   else
     [ "${1:-}" = "--" ] && shift
-    run_profile -- resume "$@"
+    home="$(active_home)"
   fi
+  ensure_recent_history_visible "$home"
+  run_codex "$home" resume "$@"
 }
+
+resume_last_profile() {
+  local name="${1:-}" home
+  if [ -n "$name" ] && [ "$name" != "--" ]; then
+    shift
+    [ "${1:-}" = "--" ] && shift
+    home="$(profile_home "$name")"
+  else
+    [ "${1:-}" = "--" ] && shift
+    home="$(active_home)"
+  fi
+  ensure_recent_history_visible "$home"
+  run_codex "$home" resume --last "$@"
+}
+
+handoff_profile() {
+  local name="$1" session_id="$2" tool tmp cwd prompt
+  profile_home "$name" >/dev/null
+  [[ "$session_id" =~ ^[0-9a-fA-F-]{36}$ ]] || die "invalid session id: $session_id"
+  tool="$BIN_DIR/codex-history"
+  [ -x "$tool" ] || die "history tool is missing or not executable: $tool"
+  tmp="$(mktemp /tmp/codex-handoff.XXXXXX)"
+  trap 'rm -f "$tmp"' RETURN
+  cwd="$("$tool" handoff --session-id "$session_id" --output "$tmp")"
+  [ -d "$cwd" ] || die "handoff working directory is missing: $cwd"
+  prompt="$(<"$tmp")"
+  note "creating portable handoff from $session_id for profile $name"
+  note "encrypted reasoning is omitted; the original session is unchanged"
+  (cd "$cwd" && run_profile "$name" -- "$prompt")
+}
+
 
 list_profiles() {
   local active="" entry name marker target
@@ -752,6 +1772,12 @@ show_paths() {
   echo "CODEX_TZ=${CODEX_TZ:-$DEFAULT_TZ}"
 }
 
+history_tool() {
+  local tool="$BIN_DIR/codex-history"
+  [ -x "$tool" ] || die "history tool is missing or not executable: $tool"
+  exec "$tool" "$@"
+}
+
 backup_profile() {
   local name="${1:-}" dest="${2:-}" home stamp
   if [ -n "$name" ] && [ "$name" != "--" ]; then
@@ -774,7 +1800,7 @@ backup_profile() {
 }
 
 doctor() {
-  local ok=1 launcher tz proxy_count override_count active runtime_link active_link version_dir runtime_zsh
+  local ok=1 launcher tz proxy_count override_count active runtime_link active_link version_dir runtime_zsh lean_runner
   ensure_root
   tz="${CODEX_TZ:-$DEFAULT_TZ}"
   echo "Bundle root:    $BUNDLE_ROOT"
@@ -789,6 +1815,17 @@ doctor() {
       echo "Active home:    $active"
       echo "Active name:    $(active_name || true)"
       ensure_shared_memory "$active"
+      if [ ! -e "$active/.codex-profile-state" ] &&
+        [ ! -L "$active/.codex-profile-state" ]; then
+        echo "Trusted state:  not initialized (created on first run)"
+      elif [ -d "$active/.codex-profile-state" ] &&
+        [ ! -L "$active/.codex-profile-state" ] &&
+        (trusted_profile_state_validate_unlocked "$active") 2>/dev/null; then
+        echo "Trusted state:  auth/config protected"
+      else
+        echo "Trusted state:  invalid"
+        ok=0
+      fi
       ensure_profile_launcher "$active"
       if check_escaping_symlinks "$active" 4; then
         echo "Profile links:  contained/shared at depth<=4"
@@ -802,6 +1839,16 @@ doctor() {
       else
         echo "Shared memory:  missing or not linked"
         ok=0
+      fi
+      if lean_mcp_configured "$active"; then
+        if lean_runner="$(find_lean_mcp_runner "$active")"; then
+          echo "Lean MCP uvx:   $lean_runner ($("$lean_runner" --version 2>/dev/null || echo unknown))"
+        else
+          echo "Lean MCP uvx:   missing (install uv so uvx is available)"
+          ok=0
+        fi
+      else
+        echo "Lean MCP uvx:   not configured"
       fi
     else
       echo "Active home:    invalid"
@@ -893,11 +1940,19 @@ main() {
     paths) show_paths ;;
     init) [ $# -eq 1 ] || die "usage: codex-profile init <name>"; init_profile "$1" ;;
     import) [ $# -eq 2 ] || die "usage: codex-profile import <name> <codex-home>"; import_profile "$1" "$2" ;;
+    import-history) [ $# -ge 1 ] || die "usage: codex-profile import-history <codex-home> [--cwd <absolute-cwd>]"; history_tool import-history "$@" ;;
+    sync-history) history_tool sync-history "$@" ;;
     switch|use) [ $# -eq 1 ] || die "usage: codex-profile switch <name>"; switch_profile "$1" ;;
     run) run_profile "$@" ;;
     run-current) run_profile -- "$@" ;;
     resume) resume_profile "$@" ;;
+    resume-last) resume_last_profile "$@" ;;
+    handoff) [ $# -eq 2 ] || die "usage: codex-profile handoff <target-profile> <session-id>"; handoff_profile "$1" "$2" ;;
     backup) backup_profile "$@" ;;
+    archive-status) history_tool status "$@" ;;
+    archive-run) history_tool archive "$@" ;;
+    restore) [ $# -eq 1 ] || die "usage: codex-profile restore <session-id>"; history_tool restore --session-id "$1" ;;
+    restore-project) [ $# -eq 1 ] || die "usage: codex-profile restore-project <absolute-cwd>"; history_tool restore --cwd "$1" ;;
     doctor|health) doctor ;;
     *) die "unknown command: $cmd" ;;
   esac
