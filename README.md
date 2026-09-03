@@ -279,9 +279,9 @@ is deliberately not dereferenced into profile backups.
 
 ## Runtime
 
-The active runtime is Codex CLI 0.151.0 for x86_64 Linux. Its CLI is built
-from official tag `rust-v0.151.0` (commit
-`78c290807ce710180111df227df3b7a4fe845452`) with local patches. Upstream
+The active runtime is Codex CLI 0.152.0 for x86_64 Linux. Its CLI is built
+from official tag `rust-v0.152.0` (commit
+`316795b3cf2a45e90d121d9f46499d4658b2645c`) with local patches. Upstream
 `server_is_overloaded` responses use the existing stream retry/backoff path, so
 `stream_max_retries = 20` applies to the capacity warning. SQLite startup waits
 up to 60 seconds for concurrent writers on shared/profile databases. Existing
@@ -319,20 +319,14 @@ Set `CODEX_USE_LOCAL_RUNTIME_CACHE=0` to bypass it or
 curated-plugin repository sync; installed plugins remain available, but their
 refresh is no longer repeated by every Codex window. The exact source diff is
 stored as `LOCAL_PATCHES.patch` in the runtime directory. Official
-0.151.0 companion resources are retained. The tracked runtime archive is split
+0.152.0 companion resources are retained. The tracked runtime archive is split
 into Git-friendly parts. `doctor` reassembles it after
 a fresh clone and checks both archive and extracted-file SHA-256 manifests.
-The unmodified 0.146.0 runtime and its split archive remain as the immediate
-rollback; the 0.145.0, 0.144.6, 0.144.1, and 0.144.0 split archives are also
-retained as rollback artifacts.
+The patched 0.151.0 runtime and its split archive remain as the immediate
+rollback; older split archives are also retained as rollback artifacts.
 
-The runtime includes the companion code-mode host and the `rg`, `bwrap`, and
-`zsh` resources shipped by the installed `@openai/codex` platform package.
-
-On this GLIBC 2.35 host, the upstream `zsh` resource requires GLIBC 2.38 and is
-not executable. Its `shell_zsh_fork` and `unified_exec_zsh_fork` features are
-disabled by default in the bundled configuration; the normal shell backend, `rg`, and `bwrap`
-remain available. `doctor` reports this optional-resource compatibility status.
+The runtime includes the locally built companion code-mode host and the `rg`
+and `bwrap` resources shipped by the official 0.152.0 Linux platform package.
 
 ## Safety defaults
 
