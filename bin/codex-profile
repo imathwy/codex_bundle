@@ -71,12 +71,12 @@ Environment:
   CODEX_ALLOW_DIRECT_PROFILE_RUNTIME=1 bypass old/direct CODEX_HOME process check
   CODEX_ALLOW_AUTH_IDENTITY_CHANGE=1 allow a non-login launch to switch accounts
   CODEX_ALLOW_PROFILE_CONFIG_CHANGE=1 allow Codex to persist config.toml changes
-  CODEX_PROFILE_GUARD_POLL_SECONDS profile auth/config guard interval; default: 0.5
+  CODEX_PROFILE_GUARD_POLL_SECONDS profile auth guard interval; default: 0.5
   CODEX_PROFILE_GUARD_SWEEP_INTERVAL_SECONDS stale guard-dir sweep interval; default: 300
   CODEX_PROFILE_GUARD_SWEEP_BUDGET directories examined per sweep; default: 400
   CODEX_PROFILE_GUARD_STALE_AGE age (date -d) past which an unowned guard dir is stale; default: 4 days
   CODEX_PROFILE_GUARD_HEARTBEAT_SECONDS live guard-dir mtime refresh interval; default: 600
-  CODEX_PROFILE_GUARD_LOCK_TIMEOUT_SECONDS profile auth/config guard lock wait; default: 20
+  CODEX_PROFILE_GUARD_LOCK_TIMEOUT_SECONDS profile auth guard lock wait; default: 20
 
 Model:
   Account credentials and config have a protected per-profile baseline. Runtime copies
@@ -1389,27 +1389,6 @@ finalize_runtime_codex_home() {
   return "$result"
 }
 
-guard_config_once() {
-  local home="$1" backup="$2" config lock_fd result=0
-  config="$home/.codex/config.toml"
-  exec {lock_fd}>"$home/.codex/config.lock" || return 20
-  chmod 600 "$home/.codex/config.lock" 2>/dev/null || true
-  if ! flock -w "${CODEX_PROFILE_GUARD_LOCK_TIMEOUT_SECONDS:-20}" "$lock_fd"; then
-    exec {lock_fd}>&-
-    return 20
-  fi
-  if [ -f "$config" ] && [ ! -L "$config" ] && cmp -s -- "$backup" "$config"; then
-    result=0
-  elif restore_guarded_file "$backup" "$config" 600; then
-    result=10
-  else
-    result=20
-  fi
-  flock -u "$lock_fd" 2>/dev/null || true
-  exec {lock_fd}>&-
-  return "$result"
-}
-
 guard_auth_once() {
   local home="$1" backup="$2" expected="$3" tool="$4"
   local auth current next lock_fd baseline="$backup" result=0
@@ -1480,22 +1459,8 @@ guard_auth_once() {
 
 guard_profile_once() {
   local home="$1" auth_backup="$2" auth_identity="$3"
-  local config_backup="$4" command="$5" quiet="${6:-0}"
+  local command="$4" quiet="${5:-0}"
   local tool="$BIN_DIR/codex-history" result status=0
-  if [ -n "$config_backup" ]; then
-    if guard_config_once "$home" "$config_backup"; then
-      :
-    else
-      result=$?
-      if [ "$result" -eq 10 ]; then
-        note "blocked profile config overwrite during ${command:-interactive} launch"
-        note "set CODEX_ALLOW_PROFILE_CONFIG_CHANGE=1 only for an intentional config change"
-      else
-        status=1
-        [ "$quiet" = 1 ] || note "could not verify profile config guard; it will retry"
-      fi
-    fi
-  fi
   if [ -n "$auth_backup" ]; then
     if guard_auth_once "$home" "$auth_backup" "$auth_identity" "$tool"; then
       :
@@ -1515,13 +1480,13 @@ guard_profile_once() {
 
 guard_profile_until_verified() {
   local home="$1" auth_backup="$2" auth_identity="$3"
-  local config_backup="$4" command="$5" attempt
+  local command="$4" attempt
   # Sibling sessions release these locks when they finalize, which is exactly
   # when the last check of this session runs. No watcher is left to repeat it,
   # so wait for a verdict here instead of reporting a contested guard.
   for attempt in 1 2 3; do
     if guard_profile_once "$home" "$auth_backup" "$auth_identity" \
-      "$config_backup" "$command" 1; then
+      "$command" 1; then
       return 0
     fi
     # Jitter: sibling sessions lose the same lock at the same moment, and a
@@ -1529,7 +1494,7 @@ guard_profile_until_verified() {
     sleep "0.$((RANDOM % 5 + 1))"
   done
   guard_profile_once "$home" "$auth_backup" "$auth_identity" \
-    "$config_backup" "$command" 0
+    "$command" 0
 }
 
 guarded_file_signature() {
@@ -1614,12 +1579,9 @@ sweep_stale_guard_dirs() {
 }
 
 cleanup_profile_guard() {
-  local guard_dir="$1" auth_backup="$2" config_backup="$3"
+  local guard_dir="$1" auth_backup="$2"
   if [ -n "$auth_backup" ]; then
     rm -f -- "$auth_backup" "$auth_backup.next"
-  fi
-  if [ -n "$config_backup" ]; then
-    rm -f -- "$config_backup"
   fi
   rm -f -- "$guard_dir/owner.pid" "$guard_dir/owner.host"
   rmdir -- "$guard_dir" 2>/dev/null || true
@@ -1627,16 +1589,14 @@ cleanup_profile_guard() {
 
 watch_profile_guard() {
   local owner_pid="$1" poll="$2" home="$3" auth_backup="$4"
-  local auth_identity="$5" config_backup="$6" command="$7" guard_dir="$8" runtime_home="${9:-}"
+  local auth_identity="$5" command="$6" guard_dir="$7" runtime_home="$8"
   local runtime_signature="" trusted_signature="" observed_runtime observed_trusted
-  local auth="$home/.codex/auth.json" config="$home/.codex/config.toml"
-  local auth_signature="" config_signature="" current_auth current_config
+  local auth="$home/.codex/auth.json" auth_signature="" current_auth
   local contested=0 beat_every beat
   beat_every="${CODEX_PROFILE_GUARD_HEARTBEAT_SECONDS:-600}"
   [[ "$beat_every" =~ ^[0-9]+$ ]] || beat_every=600
   beat=$SECONDS
   [ -z "$auth_backup" ] || auth_signature="$(guarded_file_signature "$auth")"
-  [ -z "$config_backup" ] || config_signature="$(guarded_file_signature "$config")"
   while kill -0 "$owner_pid" 2>/dev/null; do
     sleep "$poll" || break
     if [ ! -d "$guard_dir" ]; then
@@ -1646,15 +1606,7 @@ watch_profile_guard() {
       # instead of every snapshot update failing until the session ends.
       mkdir -m 700 -- "$guard_dir" 2>/dev/null || continue
       write_profile_guard_owner "$guard_dir" "$owner_pid"
-      if [ -n "$config_backup" ] && [ ! -e "$config_backup" ] &&
-        [ -f "$config" ] && [ ! -L "$config" ]; then
-        # The config baseline died with the directory and has no identity
-        # check to rebuild from; re-adopt the current config.
-        cp -p -- "$config" "$config_backup" 2>/dev/null || true
-        chmod 600 "$config_backup" 2>/dev/null || true
-      fi
       auth_signature="guard-dir-recreated"
-      config_signature="guard-dir-recreated"
       note "recreated profile guard dir after external removal: $guard_dir"
     fi
     if [ "$((SECONDS - beat))" -ge "$beat_every" ]; then
@@ -1677,16 +1629,12 @@ watch_profile_guard() {
       fi
     fi
     current_auth="$auth_signature"
-    current_config="$config_signature"
     [ -z "$auth_backup" ] || current_auth="$(guarded_file_signature "$auth")"
-    [ -z "$config_backup" ] || current_config="$(guarded_file_signature "$config")"
-    if [ "$current_auth" != "$auth_signature" ] ||
-      [ "$current_config" != "$config_signature" ]; then
+    if [ "$current_auth" != "$auth_signature" ]; then
       if guard_profile_once "$home" "$auth_backup" "$auth_identity" \
-        "$config_backup" "$command" "$contested"; then
+        "$command" "$contested"; then
         contested=0
         [ -z "$auth_backup" ] || auth_signature="$(guarded_file_signature "$auth")"
-        [ -z "$config_backup" ] || config_signature="$(guarded_file_signature "$config")"
       else
         # Keep the signatures that were verified last so the next poll checks
         # this change again, and report a contested guard once per streak.
@@ -1695,23 +1643,20 @@ watch_profile_guard() {
     fi
   done
   guard_profile_until_verified "$home" "$auth_backup" "$auth_identity" \
-    "$config_backup" "$command"
-  cleanup_profile_guard "$guard_dir" "$auth_backup" "$config_backup"
+    "$command"
+  cleanup_profile_guard "$guard_dir" "$auth_backup"
 }
 
 run_launcher_with_profile_guard() {
-  local home="$1" launcher="$2" lean_project="$3" runtime_home="$4" command="${5:-}"
-  local auth config tool poll lock_wait allow_auth allow_config protect_auth=1 protect_config=0
-  local guard_dir auth_backup="" config_backup="" before="" status watcher_pid
-  shift 4
-  command="$(runtime_command "$@")"
+  local home="$1" launcher="$2" lean_project="$3" runtime_home="$4" command="$5"
+  local auth tool poll lock_wait allow_auth protect_auth=1
+  local guard_dir auth_backup="" before="" status watcher_pid
+  shift 5
   auth="$runtime_home/auth.json"
-  config="$runtime_home/config.toml"
   tool="$BIN_DIR/codex-history"
   poll="${CODEX_PROFILE_GUARD_POLL_SECONDS:-0.5}"
   lock_wait="${CODEX_PROFILE_GUARD_LOCK_TIMEOUT_SECONDS:-20}"
   allow_auth="${CODEX_ALLOW_AUTH_IDENTITY_CHANGE:-0}"
-  allow_config="${CODEX_ALLOW_PROFILE_CONFIG_CHANGE:-0}"
   [[ "$poll" =~ ^[0-9]+([.][0-9]+)?$ ]] && [[ "$poll" =~ [1-9] ]] ||
     die "CODEX_PROFILE_GUARD_POLL_SECONDS must be a positive number"
   [[ "$lock_wait" =~ ^[0-9]+([.][0-9]+)?$ ]] && [[ "$lock_wait" =~ [1-9] ]] ||
@@ -1719,10 +1664,6 @@ run_launcher_with_profile_guard() {
   case "$allow_auth" in
     0|1) ;;
     *) die "CODEX_ALLOW_AUTH_IDENTITY_CHANGE must be 0 or 1" ;;
-  esac
-  case "$allow_config" in
-    0|1) ;;
-    *) die "CODEX_ALLOW_PROFILE_CONFIG_CHANGE must be 0 or 1" ;;
   esac
   if [ "$allow_auth" = 1 ] || [ "$command" = login ] ||
     [ "$command" = logout ] || [ ! -e "$auth" ]; then
@@ -1734,17 +1675,13 @@ run_launcher_with_profile_guard() {
     [ -x "$tool" ] || die "auth identity tool is missing or not executable: $tool"
     before="$("$tool" auth-identity --auth-file "$auth")"
   fi
-  if [ "$protect_config" -eq 1 ]; then
-    [ -f "$config" ] && [ ! -L "$config" ] ||
-      die "isolated config path must be a regular file: $config"
-  fi
   sweep_stale_guard_dirs "$(runtime_codex_home_root)"
   guard_dir="$(mktemp -d "$(runtime_codex_home_root)/codex-profile-guard.XXXXXX")"
   chmod 700 "$guard_dir" 2>/dev/null || true
   write_profile_guard_owner "$guard_dir" "$$"
   # SIGTERM is how a supervisor normally stops a session; without these the copy
   # of auth.json in the guard directory outlives the process.
-  trap 'cleanup_profile_guard "$guard_dir" "$auth_backup" "$config_backup"; cleanup_runtime_codex_home_on_exit' EXIT
+  trap 'cleanup_profile_guard "$guard_dir" "$auth_backup"; cleanup_runtime_codex_home_on_exit' EXIT
   trap 'trap - INT TERM HUP; exit 130' INT
   trap 'trap - INT TERM HUP; exit 143' TERM
   trap 'trap - INT TERM HUP; exit 129' HUP
@@ -1753,14 +1690,9 @@ run_launcher_with_profile_guard() {
     cp -p -- "$auth" "$auth_backup"
     chmod 600 "$auth_backup" 2>/dev/null || true
   fi
-  if [ "$protect_config" -eq 1 ]; then
-    config_backup="$guard_dir/config.toml"
-    cp -p -- "$config" "$config_backup"
-    chmod 600 "$config_backup" 2>/dev/null || true
-  fi
 
   watch_profile_guard "$$" "$poll" "$home" "$auth_backup" "$before" \
-    "$config_backup" "$command" "$guard_dir" "$runtime_home" 9>&- &
+    "$command" "$guard_dir" "$runtime_home" 9>&- &
   watcher_pid=$!
   set +e
   launch_codex_process "$launcher" "$lean_project" "$@"
@@ -1771,10 +1703,10 @@ run_launcher_with_profile_guard() {
   wait "$watcher_pid" 2>/dev/null
   set -e
   guard_profile_until_verified "$home" "$auth_backup" "$before" \
-    "$config_backup" "$command"
+    "$command"
   trap - INT TERM HUP
   trap cleanup_runtime_codex_home_on_exit EXIT
-  cleanup_profile_guard "$guard_dir" "$auth_backup" "$config_backup"
+  cleanup_profile_guard "$guard_dir" "$auth_backup"
   return "$status"
 }
 
@@ -1857,7 +1789,7 @@ run_codex() {
   export CODEX_HOME="$runtime_codex_home"
   set +e
   run_launcher_with_profile_guard "$home" "$launcher" "$lean_project" \
-    "$runtime_codex_home" "$@"
+    "$runtime_codex_home" "$command" "$@"
   status=$?
   "$BIN_DIR/codex-history" repair-runtime-paths \
     --runtime-root "$(runtime_codex_home_root)" --quiet

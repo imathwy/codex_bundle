@@ -705,7 +705,7 @@ class CodexProfileTests(unittest.TestCase):
                     ["bash", "-c", 'source "$1" help >/dev/null; BIN_DIR="$2"; '
                      'shift 2; "$@"', "test",
                      str(STAGED_ROOT / "bin/codex-profile"), str(root),
-                     function, str(home), str(backup), "account:expected", "",
+                     function, str(home), str(backup), "account:expected",
                      "launch", *arguments],
                     env=environment, text=True, capture_output=True, timeout=30,
                 )
