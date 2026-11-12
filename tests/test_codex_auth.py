@@ -168,8 +168,9 @@ class LiveLoginTests(unittest.TestCase):
             root = Path(temporary)
             bin_dir = root / "bin"
             bin_dir.mkdir()
-            for name in ("codex-profile", "codex-history", "codex-auth"):
+            for name in ("codex-profile", "codex-history", "codex-auth", "codex-config"):
                 shutil.copy2(ROOT / "bin" / name, bin_dir / name)
+            shutil.copytree(ROOT / "lib", root / "lib")
             runtime = root / "runtime/codex/versions/test/bin/codex"
             runtime.parent.mkdir(parents=True)
             runtime.write_text(

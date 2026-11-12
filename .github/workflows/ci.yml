@@ -1,0 +1,55 @@
+name: Bundle checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bundle-checks-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.10', '3.12']
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Prepare workspace directories
+        run: |
+          mkdir -p .work/tmp .work/cache
+          chmod 700 .work/tmp
+          printf '%s\n' "TMPDIR=$GITHUB_WORKSPACE/.work/tmp" \
+            "TMP=$GITHUB_WORKSPACE/.work/tmp" "TEMP=$GITHUB_WORKSPACE/.work/tmp" \
+            "XDG_CACHE_HOME=$GITHUB_WORKSPACE/.work/cache" >> "$GITHUB_ENV"
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Check source syntax
+        run: |
+          for script in bin/codex bin/codex-profile bin/env; do bash -n "$script"; done
+          python - <<'PY'
+          import ast
+          from pathlib import Path
+          scripts = [Path('bin') / name for name in (
+              'codex-auth', 'codex-config', 'codex-history', 'update-codex-runtime')]
+          scripts += list(Path('tests').glob('*.py')) + list(Path('lib').rglob('*.py'))
+          for path in scripts:
+              ast.parse(path.read_text(encoding='utf-8'), filename=str(path))
+          PY
+      - name: Run regression tests
+        run: python -m unittest discover -s tests -v
+      - name: Verify clean checkout, runtime checksums and relocation
+        run: python tests/smoke_bundle.py

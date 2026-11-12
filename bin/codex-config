@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+"""Portable Lean MCP configuration shared by the launcher and doctor."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10, supported without installing packages.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib/_vendor"))
+    import tomli as tomllib
+
+
+DEFAULT_LEAN = '[mcp_servers.lean-lsp]\ncommand = "uvx"\nargs = ["lean-lsp-mcp"]\n'
+
+
+def read_config(path: Path) -> tuple[str, dict]:
+    if not path.exists():
+        return "", {}
+    text = path.read_text(encoding="utf-8")
+    return text, tomllib.loads(text)
+
+
+def lean_server(config: dict) -> dict | None:
+    servers = config.get("mcp_servers", {})
+    if not isinstance(servers, dict):
+        raise ValueError("mcp_servers must be a table")
+    server = servers.get("lean-lsp")
+    if server is not None and not isinstance(server, dict):
+        raise ValueError("mcp_servers.lean-lsp must be a table")
+    return server
+
+
+def ensure_lean(path: Path, model: str) -> None:
+    # The caller holds the profile's config.lock. Preserve all user formatting
+    # and existing server definitions, including inline and quoted TOML keys.
+    if path.is_symlink():
+        raise ValueError("profile config must not be a symlink")
+    text, config = read_config(path)
+    if lean_server(config) is not None:
+        return
+    if not path.exists():
+        text = f"model = {json.dumps(model)}\n"
+    candidate = text.rstrip() + "\n\n" + DEFAULT_LEAN
+    # An explicit inline mcp_servers table cannot be extended with a section.
+    # Leave that user-owned table alone instead of producing invalid TOML.
+    try:
+        tomllib.loads(candidate)
+    except tomllib.TOMLDecodeError:
+        if "mcp_servers" in config:
+            return
+        raise
+    descriptor, temporary = tempfile.mkstemp(prefix=".config.toml.", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as target:
+            target.write(candidate)
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def effective_command(server: dict, bin_dir: Path) -> tuple[str, bool]:
+    command = server.get("command")
+    if not isinstance(command, str) or not command:
+        raise ValueError("lean-lsp stdio server needs a nonempty command")
+    if "\n" in command or "\r" in command or "\0" in command:
+        raise ValueError("lean-lsp command must be a single line")
+    path = Path(command)
+    # Older scaffolds stored <bundle>/bin/uvx. Repair that default in the
+    # runtime only; existing external runners and custom arguments stay intact.
+    legacy_default = (
+        server.get("args") == ["lean-lsp-mcp"]
+        and path.is_absolute()
+        and path.name == "uvx"
+        and path.parent.name == "bin"
+        and (path == bin_dir / "uvx" or not path.exists())
+    )
+    if legacy_default:
+        bundled = bin_dir / "uvx"
+        return (str(bundled) if bundled.exists() else "uvx"), True
+    return command, False
+
+
+def inspect_lean(config: dict, bin_dir: Path) -> tuple[str, str, bool]:
+    server = lean_server(config)
+    if server is None:
+        return "not configured", "", False
+    if server.get("enabled") is False:
+        return "disabled", "", False
+    if "url" in server:
+        return "remote (connection not checked)", "", False
+    command, migrated = effective_command(server, bin_dir)
+    return "stdio", command, migrated
+
+
+def check_runner(command: str, *, probe: bool, search_path: str | None = None) -> str:
+    runner = shutil.which(command, path=search_path)
+    if runner is None:
+        raise ValueError(f"configured command is missing or not executable: {command}")
+    # Arbitrary custom MCP commands may not support --version; do not run them.
+    if probe and Path(runner).name == "uvx":
+        try:
+            result = subprocess.run(
+                [runner, "--version"], capture_output=True, text=True, timeout=5,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise ValueError(f"uvx --version timed out: {runner}") from error
+        if result.returncode != 0 or not result.stdout.strip():
+            raise ValueError(f"uvx --version failed (exit {result.returncode}): {runner}")
+    return runner
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("action", choices=("ensure-lean", "runtime-args", "doctor"))
+    parser.add_argument("--config", required=True, type=Path)
+    parser.add_argument("--bin-dir", type=Path, default=Path(__file__).resolve().parent)
+    parser.add_argument("--model", default="gpt-6.1-sol")
+    parser.add_argument("--project", default="")
+    args = parser.parse_args()
+    try:
+        if args.action == "ensure-lean":
+            ensure_lean(args.config, args.model)
+            return 0
+        _, config = read_config(args.config)
+        kind, command, migrated = inspect_lean(config, args.bin_dir)
+        server = lean_server(config) or {}
+        server_env = server.get("env", {})
+        if not isinstance(server_env, dict):
+            raise ValueError("lean-lsp env must be a table")
+        search_path = server_env.get("PATH")
+        if search_path is not None and not isinstance(search_path, str):
+            raise ValueError("lean-lsp env.PATH must be a string")
+        if args.action == "doctor":
+            if command:
+                runner = check_runner(command, probe=True, search_path=search_path)
+                suffix = " (relocated bundle default)" if migrated else ""
+                print(f"Lean MCP:       {runner}{suffix}")
+            else:
+                print(f"Lean MCP:       {kind}")
+            return 0
+        if command:
+            try:
+                check_runner(command, probe=False, search_path=search_path)
+            except ValueError as error:
+                print(f"codex-profile: Lean MCP: {error}", file=sys.stderr)
+            if migrated:
+                print("mcp_servers.lean-lsp.command=" + json.dumps(command, ensure_ascii=False))
+            if args.project:
+                print("mcp_servers.lean-lsp.env.LEAN_PROJECT_PATH="
+                      + json.dumps(args.project, ensure_ascii=False))
+        return 0
+    except (OSError, ValueError) as error:
+        print(f"codex-profile: Lean MCP config {args.config}: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

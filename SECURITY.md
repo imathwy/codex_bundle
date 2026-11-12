@@ -28,6 +28,9 @@ The launcher selects file credential storage so login is portable across hosts
 and isolated runtime-home paths. Unrequested account changes, malformed auth and
 credential symlinks are rejected. User edits to the regular persistent config
 file remain supported.
+Runtime `tmp/` directories are private to each launch and are not merged back
+into profiles. Known dead arg0 helper links from older launches are redirected
+to the bundled executable; arbitrary escaping links remain rejected.
 
 Shared state lives under `shared/codex/`. Profile symlinks may point there only
 for the allowlisted state names. Other profile symlinks must remain in the
@@ -52,14 +55,19 @@ can read all shared conversations and memories. Keep the entire bundle private.
 SHA-256, verifies every extracted runtime component, and rejects an escaping
 runtime link. `CODEX_REAL_BIN` is accepted only within the runtime root unless
 `CODEX_ALLOW_EXTERNAL_RUNTIME=1` is explicitly set.
+`doctor` also fails if the Codex executable cannot report its version or the
+configured local Lean MCP command is unavailable. It does not test a remote
+MCP connection or authenticate an account.
 
 ## Environment gates
 
 The launcher refuses proxy variables by default, including common prefixed
-forms. Set `CODEX_ALLOW_PROXY=1` only when the proxy is intentional.
+forms. For an intentional proxy, use `export CODEX_ALLOW_PROXY=1` in Bash, or
+`CODEX_ALLOW_PROXY=1 ./bin/codex-profile run account-a` for one launch.
+`set CODEX_ALLOW_PROXY=1` in Bash does not export the variable.
 
 The launcher also refuses OpenAI, Codex, Azure, AWS, and Google provider/auth
-environment overrides by default. Set `CODEX_ALLOW_ENV_OVERRIDES=1` only when
+environment overrides by default. Use `export CODEX_ALLOW_ENV_OVERRIDES=1` only when
 you intentionally want environment credentials or provider settings to take
 precedence over the selected profile.
 
@@ -77,6 +85,8 @@ Codex runs with `TZ=JST-9` unless `CODEX_TZ` is set.
 - `backups/` contains full profile backups and credentials.
 - the reassembled runtime is generated locally from tracked split parts.
 - `.work/`, tool caches, logs and `UPGRADE_*.md` execution reports stay local.
+- `.env` files, virtualenvs and editor state stay local; sanitized
+  `.env.example` and `.env.*.example` templates may be tracked.
 - only the current runtime archive is published; rollback archives remain
   local and ignored.
 

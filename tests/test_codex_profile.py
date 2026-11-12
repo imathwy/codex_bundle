@@ -93,6 +93,8 @@ class CodexProfileTests(unittest.TestCase):
             launcher = bin_dir / "codex-profile"
             shutil.copy2(STAGED_ROOT / "bin/codex-profile", launcher)
             shutil.copy2(STAGED_ROOT / "bin/codex-auth", bin_dir / "codex-auth")
+            shutil.copy2(STAGED_ROOT / "bin/codex-config", bin_dir / "codex-config")
+            shutil.copytree(STAGED_ROOT / "lib", root / "lib")
             bundled_uvx = bin_dir / "uvx"
             bundled_uvx.write_text("#!/bin/sh\nprintf 'uvx test runner\\n'\n", encoding="utf-8")
             bundled_uvx.chmod(0o700)
@@ -299,6 +301,8 @@ class CodexProfileTests(unittest.TestCase):
             shutil.copy2(STAGED_ROOT / "bin/codex-profile", launcher)
             shutil.copy2(STAGED_ROOT / "bin/codex-history", history)
             shutil.copy2(STAGED_ROOT / "bin/codex-auth", bin_dir / "codex-auth")
+            shutil.copy2(STAGED_ROOT / "bin/codex-config", bin_dir / "codex-config")
+            shutil.copytree(STAGED_ROOT / "lib", root / "lib")
 
             runtime = root / "runtime/codex/versions/test/bin/codex"
             runtime.parent.mkdir(parents=True)

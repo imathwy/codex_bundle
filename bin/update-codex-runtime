@@ -196,9 +196,12 @@ def write_split_archive(runtime: Path, runtime_name: str) -> None:
 
 
 def write_bundle_manifest(runtime: Path) -> None:
-    names = ["bin/codex", "bin/codex-profile", "bin/codex-history", "bin/codex-auth",
+    names = ["bin/codex", "bin/codex-profile", "bin/codex-history", "bin/codex-auth", "bin/codex-config",
              "bin/env", "bin/env.fish",
-             "bin/uv", "bin/uvx", "bin/update-codex-runtime", "AGENTS.md"]
+             "bin/uv", "bin/uvx", "bin/update-codex-runtime", "AGENTS.md",
+             "LICENSES/tomli-LICENSE-MIT.txt"]
+    names.extend(str(path.relative_to(BUNDLE)) for path in
+                 sorted((BUNDLE / "lib/_vendor/tomli").glob("*.py")))
     relative = runtime.relative_to(BUNDLE)
     names.extend([f"{relative}/bin/codex", f"{relative}/MANIFEST.sha256"])
     lines = [f"{sha256(BUNDLE / name)}  {name}\n" for name in names]

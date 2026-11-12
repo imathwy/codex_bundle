@@ -15,6 +15,11 @@ corresponding source archive are included in the active runtime under
 `codex-resources/git/COPYING` and `codex-resources/git/SOURCE.tar.xz`.
 Build configuration and provenance are recorded in the runtime's `BUILD_INFO.md`.
 
+Python 3.10 uses the bundled, unmodified Tomli 2.0.1 sources in
+`lib/_vendor/tomli` to parse TOML without installing dependencies. Python 3.11+
+uses its standard library `tomllib`. Tomli is MIT-licensed; see
+`LICENSES/tomli-LICENSE-MIT.txt` and https://github.com/hukkin/tomli/tree/2.0.1.
+
 Upstream source and license materials:
 
 - https://github.com/openai/codex/tree/rust-v0.167.2
