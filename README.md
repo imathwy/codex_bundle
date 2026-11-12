@@ -365,7 +365,8 @@ companion resources are built or fetched through the official package builder. T
 `doctor` reassembles it after
 a fresh clone and checks both archive and extracted-file SHA-256 manifests.
 The patched 0.164.0 runtime and its split archive remain as the immediate
-rollback; older split archives are also retained as rollback artifacts.
+rollback. Git tracks only the current release and this rollback archive;
+older archives remain available locally and are ignored.
 
 The runtime includes the locally built code-mode host, standalone exec-server, and bwrap. Its `rg` is
 fetched and verified using the upstream package manifest.
@@ -386,8 +387,9 @@ create a second inode for another new writer. Restart existing Codex windows
 after upgrading: already-running older binaries do not gain this protection,
 and replacing the runtime link does not stop their rollout writers.
 
-Upgrade validation and host-specific limitations are recorded in
-[UPGRADE_0.167.2.md](UPGRADE_0.167.2.md).
+The 0.167.2 upgrade passed 29 bundle regression tests, 4 runtime writer-lock
+tests, 33 protocol tests, and runtime/archive checksum checks. Local upgrade
+execution reports and host-specific diagnostics are not published.
 
 Use the bundled updater to check or install the latest stable Codex release:
 
@@ -435,6 +437,13 @@ git ls-files profiles shared backups
 Only placeholder files should be tracked under profiles, shared state, and
 backups. Never force-add credentials, conversations, memories, databases, or
 backup archives.
+
+Local `UPGRADE_*.md` execution reports, logs, tool caches, temporary downloads,
+and superseded runtime archives are ignored. Only the current runtime archive
+and one immediate rollback are published, with their part files and checksums.
+When publishing a new runtime, update the two version allowlists in `.gitignore`
+and untrack superseded archives with `git rm -r --cached -- <old-parts-directory>`.
+This leaves the old files on disk for local recovery.
 
 ## Workspace storage instructions
 
