@@ -19,17 +19,13 @@ shared/codex/**
 backups/*
 !backups/.keep
 
-# Runtime publication allowlist: current release and one immediate rollback.
-# Update both versions deliberately when publishing a new release.
+# Runtime publication allowlist: only the current release.
+# Update this version deliberately when publishing a new release.
 /runtime/codex/versions/**
 !/runtime/codex/versions/0.167.2-local-runtime-shared-fork.parts/
 !/runtime/codex/versions/0.167.2-local-runtime-shared-fork.parts/part-[0-9][0-9]
 !/runtime/codex/versions/0.167.2-local-runtime-shared-fork.parts/MANIFEST.sha256
 !/runtime/codex/versions/0.167.2-local-runtime-shared-fork.parts/runtime.tar.gz.sha256
-!/runtime/codex/versions/0.164.0-local-runtime-shared-fork.parts/
-!/runtime/codex/versions/0.164.0-local-runtime-shared-fork.parts/part-[0-9][0-9]
-!/runtime/codex/versions/0.164.0-local-runtime-shared-fork.parts/MANIFEST.sha256
-!/runtime/codex/versions/0.164.0-local-runtime-shared-fork.parts/runtime.tar.gz.sha256
 
 # Local upgrade reports, downloads and scratch files are not release contents.
 /UPGRADE_*.md

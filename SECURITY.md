@@ -77,8 +77,8 @@ Codex runs with `TZ=JST-9` unless `CODEX_TZ` is set.
 - `backups/` contains full profile backups and credentials.
 - the reassembled runtime is generated locally from tracked split parts.
 - `.work/`, tool caches, logs and `UPGRADE_*.md` execution reports stay local.
-- only the current runtime and one immediate rollback archive are published;
-  older archives remain local and ignored.
+- only the current runtime archive is published; rollback archives remain
+  local and ignored.
 
 Only `.keep` placeholders are intended to be tracked in the first three areas.
 Do not force-add ignored sensitive data.

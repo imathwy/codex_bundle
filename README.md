@@ -364,9 +364,8 @@ stored as `LOCAL_PATCHES.patch` in the runtime directory. The 0.167.2
 companion resources are built or fetched through the official package builder. The runtime archive is split into Git-friendly parts.
 `doctor` reassembles it after
 a fresh clone and checks both archive and extracted-file SHA-256 manifests.
-The patched 0.164.0 runtime and its split archive remain as the immediate
-rollback. Git tracks only the current release and this rollback archive;
-older archives remain available locally and are ignored.
+Git tracks only the current release archive. Previously installed runtimes and
+their archives are retained locally for rollback and are ignored.
 
 The runtime includes the locally built code-mode host, standalone exec-server, and bwrap. Its `rg` is
 fetched and verified using the upstream package manifest.
@@ -403,8 +402,9 @@ builds the CLI and companion resources, verifies the package, and switches the
 active link only after the split archive is ready. It requires the Rust
 toolchain, `pkg-config`, and `libcap-dev`; bundled `uv` supplies Python 3.12 for
 the upstream package builder. If an upstream change conflicts with a local
-patch, the updater stops and leaves the current runtime active. Restore the
-previous runtime with `./bin/update-codex-runtime --rollback 0.164.0`. Restart
+patch, the updater stops and leaves the current runtime active. If the previous
+runtime is still installed locally, restore it with
+`./bin/update-codex-runtime --rollback 0.164.0`. Restart
 existing Codex windows after any update or rollback.
 
 ## Safety defaults
@@ -440,8 +440,8 @@ backup archives.
 
 Local `UPGRADE_*.md` execution reports, logs, tool caches, temporary downloads,
 and superseded runtime archives are ignored. Only the current runtime archive
-and one immediate rollback are published, with their part files and checksums.
-When publishing a new runtime, update the two version allowlists in `.gitignore`
+is published, with its part files and checksums.
+When publishing a new runtime, update the version allowlist in `.gitignore`
 and untrack superseded archives with `git rm -r --cached -- <old-parts-directory>`.
 This leaves the old files on disk for local recovery.
 
