@@ -1,0 +1,217 @@
+#!/usr/bin/env python3
+"""Synchronize isolated login state without waiting for the session to exit."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import stat
+import sys
+import tempfile
+import time
+from contextlib import contextmanager
+from pathlib import Path
+
+BASELINE = ".bundle-auth-sync.json"
+
+
+def read_regular(path: Path) -> bytes | None:
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return None
+    with os.fdopen(fd, "rb") as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise ValueError(f"not a regular file: {path}")
+        return stream.read()
+
+
+def digest(raw: bytes | None) -> str:
+    return "missing" if raw is None else hashlib.sha256(raw).hexdigest()
+
+
+def identity(raw: bytes | None) -> str:
+    if raw is None:
+        return "missing"
+    try:
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            raise TypeError()
+        tokens = data.get("tokens")
+        account = tokens.get("account_id") if isinstance(tokens, dict) else None
+        key = data.get("OPENAI_API_KEY")
+        if (
+            isinstance(account, str)
+            and account
+            and any(
+                isinstance(tokens.get(k), str) and tokens[k]
+                for k in ("access_token", "id_token", "refresh_token")
+            )
+        ):
+            value = "account:" + account
+        elif isinstance(key, str) and key:
+            value = "api-key:" + key
+        else:
+            raise ValueError()
+    except (ValueError, TypeError, UnicodeError):
+        raise ValueError(
+            "auth document contains no valid account credentials"
+        ) from None
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def replace_private(path: Path, raw: bytes) -> None:
+    fd, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(name, path)
+    finally:
+        Path(name).unlink(missing_ok=True)
+
+
+@contextmanager
+def locked(path: Path):
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        timeout = float(
+            os.environ.get("CODEX_PROFILE_STATE_LOCK_TIMEOUT_SECONDS", "30")
+        )
+        if timeout <= 0 or not timeout < float("inf"):
+            raise ValueError("profile state lock timeout must be positive and finite")
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"timed out waiting for {path}") from None
+                time.sleep(0.05)
+        yield
+    finally:
+        os.close(fd)
+
+
+def initialize(runtime: Path, command: str) -> None:
+    raw = read_regular(runtime / "auth.json")
+    state = {
+        "digest": digest(raw),
+        "identity": identity(raw),
+        "allow_change": command in ("login", "logout")
+        or os.environ.get("CODEX_ALLOW_AUTH_IDENTITY_CHANGE") == "1",
+        "allow_removal": command == "logout"
+        or os.environ.get("CODEX_ALLOW_AUTH_IDENTITY_CHANGE") == "1",
+    }
+    replace_private(runtime / BASELINE, json.dumps(state).encode())
+
+
+def synchronize(profile: Path, runtime: Path) -> None:
+    trusted = profile / ".codex-profile-state"
+    auth = trusted / "auth.json"
+    marker = trusted / "auth.json.missing"
+    # Match the launcher's lock order. The runtime lock also serializes with
+    # upstream refresh commits, so a poll cannot copy a half-written credential.
+    with locked(profile / ".codex-profile-state.lock"), locked(runtime / "auth.lock"):
+        if trusted.is_symlink() or read_regular(trusted / "version") != b"1\n":
+            raise ValueError("trusted profile state is missing or unsafe")
+        baseline = json.loads(read_regular(runtime / BASELINE) or b"null")
+        if not isinstance(baseline, dict):
+            raise TypeError("runtime auth synchronization baseline is missing")
+        stored = read_regular(auth)
+        absent = read_regular(marker)
+        if (stored is None) == (absent is None):
+            raise ValueError("trusted auth state is inconsistent")
+        current = read_regular(runtime / "auth.json")
+        current_digest = digest(current)
+        stored_digest = digest(stored)
+        before = baseline["digest"]
+        if current_digest == before and stored_digest == before:
+            return
+        if current_digest != before:
+            try:
+                current_identity = identity(current)
+            except ValueError:
+                print(
+                    "codex-auth: ignored invalid runtime auth replacement",
+                    file=sys.stderr,
+                )
+                return
+            allowed = (
+                baseline["allow_removal"]
+                if current is None
+                else baseline["allow_change"]
+                or baseline["identity"] == "missing"
+                or current_identity == baseline["identity"]
+            )
+            if not allowed:
+                print(
+                    "codex-auth: discarded isolated auth identity change or removal",
+                    file=sys.stderr,
+                )
+                return
+            # Never resurrect a logout, revert another login, or overwrite a
+            # newer refresh. Compare AND commit while holding the same lock.
+            if stored_digest == before:
+                if current is None:
+                    replace_private(marker, b"")
+                    auth.unlink(missing_ok=True)
+                else:
+                    replace_private(auth, current)
+                    marker.unlink(missing_ok=True)
+                stored, stored_digest = current, current_digest
+            elif stored_digest != current_digest:
+                print(
+                    "codex-auth: kept newer trusted credentials from another session",
+                    file=sys.stderr,
+                )
+
+        # A sibling refresh can be adopted only within this session's identity.
+        # Never change the account of a running conversation implicitly.
+        stored_identity = identity(stored)
+        if stored_digest == current_digest:
+            baseline.update(digest=stored_digest, identity=stored_identity)
+        elif stored is not None and (
+            stored_identity == baseline["identity"]
+            or (baseline["identity"] == "missing" and current is None)
+        ):
+            replace_private(runtime / "auth.json", stored)
+            baseline.update(digest=stored_digest, identity=stored_identity)
+        else:
+            return
+        replace_private(runtime / BASELINE, json.dumps(baseline).encode())
+        with locked(profile / ".codex/auth.lock"):
+            mirror = profile / ".codex/auth.json"
+            if stored is None:
+                mirror.unlink(missing_ok=True)
+            elif read_regular(mirror) != stored:
+                replace_private(mirror, stored)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("action", choices=("init", "sync"))
+    parser.add_argument("--profile-home", type=Path)
+    parser.add_argument("--runtime-home", required=True, type=Path)
+    parser.add_argument("--command", default="")
+    args = parser.parse_args()
+    if args.action == "init":
+        initialize(args.runtime_home, args.command)
+    elif args.profile_home is None:
+        parser.error("sync requires --profile-home")
+    else:
+        synchronize(args.profile_home, args.runtime_home)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (OSError, ValueError, TypeError, KeyError) as error:
+        print(f"codex-auth: {error}", file=sys.stderr)
+        raise SystemExit(1)

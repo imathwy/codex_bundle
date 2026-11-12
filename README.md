@@ -14,6 +14,9 @@ shared-state links are relative, so the directory can be moved or cloned.
 ./bin/codex
 ```
 
+New profiles default to `gpt-6.1-sol`. Change `model` in the profile's
+`.codex/config.toml` to select a different default, or pass `--model` for one launch.
+
 Create one profile per ChatGPT/OpenAI account:
 
 ```bash
@@ -60,7 +63,7 @@ domain and exact continuation is required.
 ```
 
 Every launch now gives the runtime a private, mode-`0700` `CODEX_HOME` under
-`/var/tmp/codex-profile-runtime-<uid>/`. Its `auth.json` and `config.toml` are copied from the selected profile's
+`<bundle>/.work/runtime-homes-<uid>/`. Its `auth.json` and `config.toml` are copied from the selected profile's
 authoritative `.codex-profile-state` directory; established non-sensitive state
 and shared sessions/databases are linked back to their normal locations. New and
 imported profiles create this trusted state atomically.
@@ -77,9 +80,14 @@ same profile through GPFS.
 This isolates TUI-internal conversation transitions. In particular, `/new`,
 `/btw` (the `/side` alias), `/side`, and `/fork` may rewrite their runtime
 copies without overwriting the selected profile. Config changes are discarded
-on exit by default. Same-account auth token refreshes and explicit
-login/logout are committed to the trusted state; account-identity changes are
-discarded otherwise.
+on exit by default. Initial login, same-account token refreshes and explicit
+login/logout are synchronized into trusted state while the window is open
+(normally within the 0.5-second guard interval), and checked again at exit.
+Opening another `resume` window therefore does not depend on closing the login
+window first. Lock-protected comparison prevents an old window from undoing a
+newer login, logout or refresh. Account-identity changes are discarded otherwise.
+The launcher uses file credential storage, preserving login across machines and
+temporary runtime-home paths.
 
 For an intentional config change, edit the profile's ordinary
 `.codex/config.toml`; the launcher accepts that regular file into protected
@@ -108,9 +116,16 @@ removals, and malformed replacements are discarded.
 Use an explicit `login`/`logout` command for intentional account changes, or set
 `CODEX_ALLOW_AUTH_IDENTITY_CHANGE=1` for an exceptional interactive change. The
 persistent-file watcher remains as defense in depth for older or external
-processes and polls at 0.5 seconds by default. Isolated runtime homes live below
-a uid-owned mode-`0700` directory in `/var/tmp`; guard snapshots remain mode
-`0700`/`0600` under `/tmp`. Both are removed after the launch.
+processes and polls at 0.5 seconds by default. Every check compares the
+persistent file with its guarded snapshot first, so an unchanged file is
+verified without starting an identity process, and the auth lock that all
+sessions of one profile share stays held for a comparison. A check waits
+`CODEX_PROFILE_GUARD_LOCK_TIMEOUT_SECONDS` (20 by default) for that lock, like
+every other holder; one that still cannot take it keeps the snapshot it last
+verified, repeats on the next poll, and reports a contested guard once instead
+of on every attempt. Isolated runtime homes live below
+a uid-owned mode-`0700` directory in `<bundle>/.work/runtime-homes-<uid>/`; guard snapshots remain mode
+`0700`/`0600` under that same private root. Both are removed after the launch.
 
 For a large shared session store, bare `resume` opens the picker filtered to the
 current working directory. Use `resume-last` to continue the newest session
@@ -145,7 +160,7 @@ History maintenance locks wait at most 10 seconds by default and report the
 recorded holder instead of blocking silently forever. Set
 `CODEX_HISTORY_LOCK_TIMEOUT_SECONDS` to change that bound. History SQLite busy
 waits are independently bounded at 10 seconds by
-`CODEX_HISTORY_DB_TIMEOUT_SECONDS`. The node-local
+`CODEX_HISTORY_DB_TIMEOUT_SECONDS`. The
 runtime-cache lock similarly defaults to 30 seconds and is controlled by
 `CODEX_RUNTIME_CACHE_LOCK_TIMEOUT_SECONDS`.
 
@@ -196,6 +211,28 @@ with all shared-state links. Full recursive profile-link validation remains
 mandatory for `init`, `import`, `backup`, and `doctor`; run `doctor` after a
 manual profile migration or whenever a full security audit is desired.
 
+The legacy-process guard scans `/proc` in one Python process. It still rejects
+Codex runtimes using the selected profile's persistent `CODEX_HOME`, without
+spawning a separate `readlink` process for every process on a busy host.
+
+### Many concurrent sessions of one profile
+
+Launch and exit bookkeeping takes per-profile locks: the trusted state, the
+profile config, the profile files, and the merge of the isolated runtime home.
+Each holder keeps its lock for a comparison or a file copy, so the wait, not the
+work, is what fails first when dozens of sessions of one profile start or finish
+together. `CODEX_PROFILE_STATE_LOCK_TIMEOUT_SECONDS` and
+`CODEX_RUNTIME_HOME_LOCK_TIMEOUT_SECONDS` (30 seconds each by default) set those
+waits. A contested runtime-state merge reports the contention and leaves the
+runtime's regenerable state behind rather than failing a session that already
+finished its work; losing a lock never exits silently.
+
+The launch-time rollout-path repair rewrites the same global rows for every
+profile, so one launcher at a time performs it while the others defer to it, and
+it waits `CODEX_HISTORY_REPAIR_DB_TIMEOUT_SECONDS` (60 seconds) for the shared
+state database. A database that stays busy defers the repair to the next launch
+instead of refusing to start Codex; the rows stay valid either way.
+
 ## Shared memory model
 
 Each profile has an isolated, authoritative `HOME`. A launch receives a temporary
@@ -206,8 +243,10 @@ and shared store:
   authoritative account-specific credentials and configuration.
 - The matching files under `profiles/<name>/.codex/` are compatibility mirrors.
 - Plugins, skills, caches, and installation identity remain profile-specific.
-- `shared/codex/sessions/`, `archived_sessions/`, `history.jsonl`, and
-  `shell_snapshots/` are shared.
+- `shared/codex/sessions/`, `archived_sessions/`, `history.jsonl`,
+  `shell_snapshots/`, and `thread-writer-locks/` are shared. Keeping writer
+  locks under the stable shared root prevents isolated runtime homes and
+  different profiles from opening concurrent writers for the same rollout.
 - `state_*.sqlite`, `memories_*.sqlite`, and `goals_*.sqlite` are shared. This
   includes Codex's explicit memory database, thread index, durable goals, and
   thread-related state.
@@ -279,13 +318,13 @@ is deliberately not dereferenced into profile backups.
 
 ## Runtime
 
-The active runtime is Codex CLI 0.152.0 for x86_64 Linux. Its CLI is built
-from official tag `rust-v0.152.0` (commit
-`316795b3cf2a45e90d121d9f46499d4658b2645c`) with local patches. Upstream
+The active runtime is Codex CLI 0.167.2 for x86_64 Linux. Its CLI is built
+from official tag `rust-v0.167.2` (commit
+`ce21072c90d32c40af7a55b60b2fb35c84a43a6a`) with local patches. Upstream
 `server_is_overloaded` responses use the existing stream retry/backoff path, so
 `stream_max_retries = 20` applies to the capacity warning. SQLite startup waits
 up to 60 seconds for concurrent writers on shared/profile databases. Existing
-databases are opened without reapplying write-locking WAL/auto-vacuum pragmas,
+WAL databases are opened without reapplying write-locking WAL/auto-vacuum pragmas,
 and up-to-date migration sets are verified read-only so startup does not stall
 active Codex writers. Reference-based forks may also read rollouts under the
 canonical directory named by `CODEX_SHARED_SESSIONS_ROOT`; `codex-profile`
@@ -313,22 +352,58 @@ rows whose rollout file exists are changed automatically; missing rows are never
 deleted unless `codex-history repair-runtime-paths --prune-stale` is requested
 explicitly.
 
-To avoid repeatedly loading the roughly 300 MB runtime from GPFS, the launcher
-keeps a manifest-keyed node-local copy under
-`/tmp/codex-bundle-runtime-cache-<uid>/` and executes that copy by default.
+The launcher keeps a manifest-keyed executable cache under
+`<bundle>/.work/runtime-cache-<uid>/` and executes that copy by default, keeping
+generated files in the persistent workspace. This default does not provide
+node-local acceleration when the bundle is on GPFS.
 Set `CODEX_USE_LOCAL_RUNTIME_CACHE=0` to bypass it or
 `CODEX_RUNTIME_CACHE_ROOT` to move it. Startup also disables the automatic
 curated-plugin repository sync; installed plugins remain available, but their
 refresh is no longer repeated by every Codex window. The exact source diff is
-stored as `LOCAL_PATCHES.patch` in the runtime directory. Official
-0.152.0 companion resources are retained. The tracked runtime archive is split
-into Git-friendly parts. `doctor` reassembles it after
+stored as `LOCAL_PATCHES.patch` in the runtime directory. The 0.167.2
+companion resources are built or fetched through the official package builder. The runtime archive is split into Git-friendly parts.
+`doctor` reassembles it after
 a fresh clone and checks both archive and extracted-file SHA-256 manifests.
-The patched 0.151.0 runtime and its split archive remain as the immediate
+The patched 0.164.0 runtime and its split archive remain as the immediate
 rollback; older split archives are also retained as rollback artifacts.
 
-The runtime includes the locally built companion code-mode host and the `rg`
-and `bwrap` resources shipped by the official 0.152.0 Linux platform package.
+The runtime includes the locally built code-mode host, standalone exec-server, and bwrap. Its `rg` is
+fetched and verified using the upstream package manifest.
+The bundled `uv` and `uvx` runners are upgraded to 0.13.7. A relocatable
+Git 2.55.0 is included on `codex-path` so worktree operations support the newer
+Git options used by Codex. The system Git installation is unchanged.
+
+Paginated history now tolerates malformed records, duplicate/regressed ordinals,
+and forward gaps using upstream projection logic introduced in 0.156.1. This fixes the
+`expected ordinal 26364, got 2814` fork failure reproduced on a copy of the
+reported session. The original rollout is not rewritten; invalid or regressed
+records may be omitted from projected history.
+
+Writer ownership also holds a persistent `<thread-id>.lease` alongside the
+upstream compatibility `.lock`. The lease is released by closing its file
+handle, and its empty file is retained so compatibility-lock cleanup cannot
+create a second inode for another new writer. Restart existing Codex windows
+after upgrading: already-running older binaries do not gain this protection,
+and replacing the runtime link does not stop their rollout writers.
+
+Upgrade validation and host-specific limitations are recorded in
+[UPGRADE_0.167.2.md](UPGRADE_0.167.2.md).
+
+Use the bundled updater to check or install the latest stable Codex release:
+
+```bash
+./bin/update-codex-runtime --check
+./bin/update-codex-runtime
+```
+
+The updater carries the current runtime source patch into the new official tag,
+builds the CLI and companion resources, verifies the package, and switches the
+active link only after the split archive is ready. It requires the Rust
+toolchain, `pkg-config`, and `libcap-dev`; bundled `uv` supplies Python 3.12 for
+the upstream package builder. If an upstream change conflicts with a local
+patch, the updater stops and leaves the current runtime active. Restore the
+previous runtime with `./bin/update-codex-runtime --rollback 0.164.0`. Restart
+existing Codex windows after any update or rollback.
 
 ## Safety defaults
 
@@ -360,3 +435,27 @@ git ls-files profiles shared backups
 Only placeholder files should be tracked under profiles, shared state, and
 backups. Never force-add credentials, conversations, memories, databases, or
 backup archives.
+
+## Workspace storage instructions
+
+The tracked `AGENTS.md` is loaded on every bundle launch, even from other
+projects. The isolated runtime home's `AGENTS.override.md` combines the profile's
+existing global instructions (override first, otherwise AGENTS.md) with this
+bundle policy. The combined file is private and is never merged back into the
+profile. This follows [Codex global instruction discovery](https://developers.openai.com/codex/guides/agents-md).
+
+Prefer the persistent workspace for downloads, builds, logs, backups, caches and
+temporary files; avoid `/tmp`, `/var/tmp` and `/root` whenever practical.
+`TMPDIR`, `TMP` and `TEMP` point to the selected profile's `.cache/tmp`.
+Runtime homes, guard snapshots, handoff files, history-index homes and updater
+source/archive staging default to bundle-local `.work/`, which Git ignores.
+`CODEX_RUNTIME_HOME_ROOT` and `CODEX_RUNTIME_CACHE_ROOT` allow explicit location
+overrides. The workspace cache may be slower than node-local storage on GPFS;
+`CODEX_USE_LOCAL_RUNTIME_CACHE=0` runs the bundled runtime directly.
+
+Existing windows must be restarted to load these launcher defaults and global
+instructions. Existing files in container-local directories are not removed.
+
+启动器统一传入 `--no-daemon`，包括新会话、resume 和 fork，直接使用随交互进程退出的内嵌服务，不再启动后台 app-server daemon 或等待其控制 socket。0.167.2 的 `agents --no-daemon` 也支持这种方式。
+
+所有 profile 的启动器默认使用普通 scrollback（`tui.raw_output_mode = false`、`tui.alternate_screen = "never"`），保持工具输出精简并保留终端滚动历史。新会话、resume 和 fork 均应用，重启已有窗口后生效。

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import fcntl
 import importlib.machinery
 import importlib.util
 import json
+import os
 import sqlite3
+import subprocess
 import time
 import unittest
 import uuid
@@ -22,6 +25,58 @@ codex_history = importlib.util.module_from_spec(SPEC)
 LOADER.exec_module(codex_history)
 
 DAY_MS = 86_400_000
+
+
+class DirectRuntimeProcessTests(unittest.TestCase):
+    def test_scan_preserves_runtime_and_exact_profile_matching(self) -> None:
+        with TemporaryDirectory() as temporary:
+            proc = Path(temporary)
+            home = proc / "profile with spaces"
+            expected = f"CODEX_HOME={home}/.codex".encode()
+
+            def process(pid, executable, arguments, environment):
+                directory = proc / str(pid)
+                directory.mkdir()
+                if executable is not None:
+                    (directory / "exe").symlink_to(executable)
+                (directory / "cmdline").write_bytes(arguments)
+                (directory / "environ").write_bytes(environment)
+
+            process(101, "/runtime/bin/codex", b"custom-name\0", expected + b"\0")
+            process(102, "/old/codex-code-mode-host (deleted)", b"", expected + b"\0")
+            process(103, "/usr/bin/bash", b"bash\0/runtime/bin/codex\0", expected + b"\0")
+            process(104, "/usr/bin/sleep", b"sleep\0" + b"30\0", expected + b"\0")
+            process(105, "/runtime/bin/codex", b"", b"CODEX_HOME=/other/.codex\0")
+            process(106, "/runtime/bin/codex", b"", b"OTHER_" + expected + b"\0")
+            process(107, "/runtime/bin/codex", b"", expected + b"-other\0")
+            process(108, "/runtime/bin/codex", b"", expected + b"\0")
+            process(109, None, b"/runtime/codex-code-mode-host\0", b"BINARY=\xff\0" + expected + b"\0")
+            process(110, "/runtime/bin/codex-other", b"codex-other\0", expected + b"\0")
+            process(111, "/runtime/bin/codex", b"", expected + b"\0")
+            (proc / "111/environ").unlink()
+            (proc / "112").mkdir()  # A process that exited during enumeration.
+            (proc / "self").symlink_to("101")
+
+            self.assertEqual(
+                codex_history.direct_profile_runtime_pids(
+                    home, proc_root=proc, exclude_pid=108
+                ),
+                [101, 102, 103, 109],
+            )
+
+    def test_unreadable_process_is_skipped_but_scan_failure_propagates(self) -> None:
+        with TemporaryDirectory() as temporary:
+            proc = Path(temporary)
+            process = proc / "123"
+            process.mkdir()
+            (process / "exe").symlink_to("/runtime/bin/codex")
+            with mock.patch.object(Path, "read_bytes", side_effect=PermissionError):
+                self.assertEqual(
+                    codex_history.direct_profile_runtime_pids(proc, proc_root=proc), []
+                )
+            with mock.patch.object(codex_history.os, "scandir", side_effect=PermissionError):
+                with self.assertRaises(PermissionError):
+                    codex_history.direct_profile_runtime_pids(proc, proc_root=proc)
 
 
 def create_state_schema(db: sqlite3.Connection) -> None:
@@ -518,3 +573,82 @@ class CodexHistoryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RuntimePathRepairContentionTests(unittest.TestCase):
+    """The pre-launch repair must never turn database contention into a failed launch."""
+
+    def fixture(self, root: Path) -> tuple[Path, Path, str]:
+        shared = root / "shared/codex"
+        sessions = shared / "sessions"
+        shared.mkdir(parents=True)
+        state = shared / "state_5.sqlite"
+        runtime_root = (root / "runtime-homes").resolve()
+        dead_home = runtime_root / "codex-profile-home.dead00"
+        thread_id = str(uuid.uuid4())
+        rollout = write_rollout(sessions, thread_id)
+        with sqlite3.connect(state) as db:
+            create_state_schema(db)
+            insert_thread(db, thread_id, dead_home / "sessions" / rollout.relative_to(sessions), 1000)
+        return shared, runtime_root, thread_id
+
+    def repair(self, root: Path, runtime_root: Path, **env: str) -> subprocess.CompletedProcess[str]:
+        environment = os.environ.copy()
+        # bundle_root() follows the script, so the shared root is what redirects
+        # this run at the fixture's state database.
+        environment["CODEX_SHARED_ROOT"] = str((root / "shared/codex").resolve())
+        environment.update(env)
+        return subprocess.run(
+            [str(BUNDLE_ROOT / "bin/codex-history"), "repair-runtime-paths",
+             "--runtime-root", str(runtime_root)],
+            env=environment, text=True, capture_output=True, timeout=60,
+        )
+
+    def rollout_path(self, shared: Path, thread_id: str) -> str:
+        with sqlite3.connect(shared / "state_5.sqlite") as db:
+            return dict(db.execute("SELECT id, rollout_path FROM threads"))[thread_id]
+
+    def test_busy_state_database_defers_instead_of_failing(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            shared, runtime_root, thread_id = self.fixture(root)
+            before = self.rollout_path(shared, thread_id)
+            blocker = sqlite3.connect(shared / "state_5.sqlite", isolation_level=None)
+            # A write lock, which blocks the repair's UPDATE in both journal modes.
+            blocker.execute("BEGIN IMMEDIATE")
+            blocker.execute(
+                "UPDATE threads SET recency_at_ms = recency_at_ms + 1 WHERE id = ?",
+                (thread_id,),
+            )
+            try:
+                result = self.repair(root, runtime_root,
+                                     CODEX_HISTORY_REPAIR_DB_TIMEOUT_SECONDS="0.1")
+            finally:
+                blocker.execute("ROLLBACK")
+                blocker.close()
+            self.assertEqual(result.returncode, codex_history.REPAIR_DEFERRED_EXIT)
+            self.assertIn("stayed busy", result.stderr)
+            self.assertEqual(self.rollout_path(shared, thread_id), before)
+
+            # The same repair succeeds once the writer is gone.
+            recovered = self.repair(root, runtime_root)
+            self.assertEqual(recovered.returncode, 0, recovered.stderr)
+            self.assertIn("normalized=1", recovered.stdout)
+
+    def test_concurrent_launcher_defers_without_touching_the_database(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            shared, runtime_root, thread_id = self.fixture(root)
+            before = self.rollout_path(shared, thread_id)
+            holder = (shared / ".repair-runtime-paths.lock").open("a+")
+            fcntl.flock(holder, fcntl.LOCK_EX)
+            try:
+                started = time.monotonic()
+                result = self.repair(root, runtime_root)
+                waited = time.monotonic() - started
+            finally:
+                holder.close()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("another launcher is repairing them", result.stdout)
+            self.assertLess(waited, 30)
+            self.assertEqual(self.rollout_path(shared, thread_id), before)

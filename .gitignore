@@ -22,3 +22,6 @@ runtime/codex/versions/*
 !runtime/codex/versions/*.parts/**
 runtime/codex/versions/*.tmp.*
 runtime/codex/versions/.codex-runtime.*
+
+# Workspace-local temporary, build and tool-cache data.
+.work/

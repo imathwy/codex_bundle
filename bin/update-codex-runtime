@@ -1,0 +1,362 @@
+#!/usr/bin/env python3
+"""Build a patched Codex release and atomically select it for this bundle."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shutil
+import shlex
+import subprocess
+import sys
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+
+BUNDLE = Path(__file__).resolve().parent.parent
+VERSIONS = BUNDLE / "runtime/codex/versions"
+CURRENT = BUNDLE / "runtime/codex/current"
+UPDATE_LOCK = VERSIONS / ".codex-runtime-update.lock"
+RELEASE_API = "https://api.github.com/repos/openai/codex/releases/latest"
+REPOSITORY = "https://github.com/openai/codex.git"
+
+
+def command(argv: list[str], *, cwd: Path | None = None, env: dict[str, str] | None = None,
+            output: bool = False) -> str:
+    print("+", " ".join(argv), flush=True)
+    result = subprocess.run(argv, cwd=cwd, env=env, check=True,
+                            stdout=subprocess.PIPE if output else None, text=True)
+    return result.stdout.strip() if output else ""
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def release_version(value: str) -> str:
+    if not re.fullmatch(r"\d+\.\d+\.\d+", value):
+        raise ValueError(f"expected a stable Codex version, got {value!r}")
+    return value
+
+
+def latest_version() -> str:
+    request = urllib.request.Request(RELEASE_API, headers={"User-Agent": "codex-bundle-updater"})
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            release = json.load(response)
+        if release.get("draft") or release.get("prerelease"):
+            raise RuntimeError("GitHub's latest release is not stable")
+        tag = release["tag_name"]
+    except urllib.error.HTTPError as error:
+        if error.code not in (403, 429):
+            raise
+        # GitHub's public latest-release redirect works when anonymous API
+        # requests are rate-limited and still selects a stable release.
+        latest = urllib.request.Request(
+            "https://github.com/openai/codex/releases/latest",
+            headers={"User-Agent": "codex-bundle-updater"},
+        )
+        with urllib.request.urlopen(latest, timeout=30) as response:
+            tag = urllib.parse.urlsplit(response.url).path.rsplit("/", 1)[-1]
+    if not tag.startswith("rust-v"):
+        raise RuntimeError(f"unexpected release tag: {tag}")
+    return release_version(tag.removeprefix("rust-v"))
+
+
+def active_runtime() -> tuple[Path, dict]:
+    executable = CURRENT.resolve(strict=True)
+    runtime = executable.parent.parent
+    if not runtime.is_relative_to(VERSIONS.resolve(strict=True)):
+        raise RuntimeError(f"active runtime escapes {VERSIONS}: {runtime}")
+    with (runtime / "codex-package.json").open(encoding="utf-8") as source:
+        metadata = json.load(source)
+    release_version(metadata["version"])
+    if not (runtime / "LOCAL_PATCHES.patch").is_file():
+        raise RuntimeError("active runtime is missing LOCAL_PATCHES.patch")
+    return runtime, metadata
+
+
+def cargo_executable() -> Path:
+    found = shutil.which("cargo")
+    local_cargo = BUNDLE / ".work/toolchain/cargo/bin/cargo"
+    fallback = local_cargo if local_cargo.is_file() else Path.home() / ".cargo/bin/cargo"
+    executable = Path(found) if found else fallback
+    if not executable.is_file():
+        raise RuntimeError("cargo is missing; install the Rust toolchain with rustup first")
+    return executable
+
+
+def prepare_source(work: Path, current: Path, current_meta: dict, tag: str) -> Path:
+    source = work / "source"
+    base_tag = current_meta.get("upstreamTag", f"rust-v{current_meta['version']}")
+    command(["git", "clone", "--filter=blob:none", "--no-checkout", "--depth=1",
+             "--single-branch", "--branch", tag, REPOSITORY, str(source)])
+    command(["git", "fetch", "--depth=1", "origin",
+             f"refs/tags/{base_tag}:refs/tags/{base_tag}"], cwd=source)
+    command(["git", "checkout", "--detach", base_tag], cwd=source)
+    patch = current / "LOCAL_PATCHES.patch"
+    # Cargo's local workspace versions change with every release. Cargo updates
+    # its lockfile during the build; port only behavioral source changes.
+    command(["git", "apply", "--exclude=codex-rs/Cargo.lock", "--check", str(patch)], cwd=source)
+    command(["git", "apply", "--exclude=codex-rs/Cargo.lock", str(patch)], cwd=source)
+    command(["git", "add", "-A"], cwd=source)
+    command(["git", "-c", "user.name=Codex Bundle Updater",
+             "-c", "user.email=codex-bundle@localhost", "commit", "-m",
+             "Carry bundle runtime patches"], cwd=source)
+    local_commit = command(["git", "rev-parse", "HEAD"], cwd=source, output=True)
+    command(["git", "checkout", "--detach", tag], cwd=source)
+    # A real conflict needs a source review. Never prefer one side automatically.
+    command(["git", "-c", "user.name=Codex Bundle Updater",
+             "-c", "user.email=codex-bundle@localhost", "cherry-pick", local_commit], cwd=source)
+    return source
+
+
+def build_package(work: Path, source: Path, bundle: Path) -> Path:
+    cargo = cargo_executable()
+    uv = bundle / "bin/uv"
+    if not uv.is_file():
+        raise RuntimeError(f"missing bundled Python runner: {uv}")
+    command(["pkg-config", "--exists", "libcap"])
+    target = "x86_64-unknown-linux-gnu"
+    cargo_env = os.environ.copy()
+    cargo_env["PATH"] = f"{cargo.parent}:{cargo_env.get('PATH', '')}"
+    command([str(cargo), "build", "--target", target, "--release", "--package", "codex-bwrap", "--bin", "bwrap"],
+            cwd=source / "codex-rs", env=cargo_env)
+    bwrap = source / "codex-rs/target" / target / "release/bwrap"
+    command(["strip", "--strip-debug", "--strip-unneeded", str(bwrap)])
+    cargo_env["CODEX_BWRAP_SHA256"] = sha256(bwrap)
+    cargo_env["CODEX_REPO_ROOT"] = str(source)
+    package = work / "package"
+    # Restrict Cargo to shipped targets instead of selecting every workspace
+    # member and fetching dependencies for unrelated developer tools.
+    packages = ["codex-cli", "codex-code-mode-host"]
+    # 0.167 ships a separate executor; keep older release builds supported too.
+    if (source / "codex-rs/exec-server-cli/Cargo.toml").is_file():
+        packages.append("codex-exec-server-cli")
+    selected_cargo = work / "cargo-package"
+    selected_cargo.write_text(
+        "#!/bin/sh\nexec " + shlex.quote(str(cargo))
+        + ' "$@"' + "".join(" --package " + shlex.quote(name) for name in packages) + "\n",
+        encoding="utf-8")
+    selected_cargo.chmod(0o700)
+    command([str(uv), "run", "--python", "3.12", "--no-project", "python",
+             "scripts/build_codex_package.py", "--target", target, "--variant", "codex",
+             "--cargo-profile", "release", "--cargo", str(selected_cargo), "--package-dir", str(package),
+             "--bwrap-bin", str(bwrap)], cwd=source, env=cargo_env)
+    for name in ("codex", "codex-code-mode-host", "codex-exec-server"):
+        binary = package / "bin" / name
+        if binary.is_file():
+            command(["strip", "--strip-debug", "--strip-unneeded", str(binary)])
+    return package
+
+
+def write_manifest(runtime: Path) -> None:
+    lines = []
+    for path in sorted(runtime.rglob("*")):
+        if path.is_file() and path != runtime / "MANIFEST.sha256":
+            relative = path.relative_to(runtime)
+            lines.append(f"{sha256(path)}  {relative.as_posix()}\n")
+    (runtime / "MANIFEST.sha256").write_text("".join(lines), encoding="utf-8")
+
+
+def write_split_archive(runtime: Path, runtime_name: str) -> None:
+    destination = VERSIONS / f"{runtime_name}.parts"
+    if destination.exists():
+        raise RuntimeError(f"runtime archive already exists: {destination}")
+    part_stage = Path(tempfile.mkdtemp(prefix=".codex-parts-", dir=VERSIONS))
+    try:
+        with tempfile.TemporaryDirectory(prefix="codex-archive-", dir=BUNDLE / ".work") as temporary:
+            archive = Path(temporary) / "runtime.tar.gz"
+            command(["tar", "-czf", str(archive), "-C", str(runtime), "."])
+            checksums = []
+            with archive.open("rb") as source:
+                for index, block in enumerate(iter(lambda: source.read(90 * 1024 * 1024), b"")):
+                    part = part_stage / f"part-{index:02d}"
+                    part.write_bytes(block)
+                    checksums.append(f"{sha256(part)}  {part.name}\n")
+            (part_stage / "MANIFEST.sha256").write_text("".join(checksums), encoding="utf-8")
+            (part_stage / "runtime.tar.gz.sha256").write_text(
+                f"{sha256(archive)}  runtime.tar.gz\n", encoding="utf-8")
+            command(["sha256sum", "--check", "--status", "MANIFEST.sha256"], cwd=part_stage)
+        os.replace(part_stage, destination)
+    except Exception:
+        shutil.rmtree(part_stage, ignore_errors=True)
+        raise
+
+
+def write_bundle_manifest(runtime: Path) -> None:
+    names = ["bin/codex", "bin/codex-profile", "bin/codex-history", "bin/codex-auth",
+             "bin/env", "bin/env.fish",
+             "bin/uv", "bin/uvx", "bin/update-codex-runtime", "AGENTS.md"]
+    relative = runtime.relative_to(BUNDLE)
+    names.extend([f"{relative}/bin/codex", f"{relative}/MANIFEST.sha256"])
+    lines = [f"{sha256(BUNDLE / name)}  {name}\n" for name in names]
+    descriptor, temporary = tempfile.mkstemp(prefix=".MANIFEST.", dir=BUNDLE)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as target:
+        target.writelines(lines)
+    os.replace(temporary, BUNDLE / "MANIFEST.sha256")
+
+
+def activate(runtime: Path) -> None:
+    temporary_link = CURRENT.with_name(f".current.{os.getpid()}")
+    try:
+        temporary_link.symlink_to(f"versions/{runtime.name}/bin/codex")
+        os.replace(temporary_link, CURRENT)
+    finally:
+        temporary_link.unlink(missing_ok=True)
+    write_bundle_manifest(runtime)
+
+
+def install(source: Path, package: Path, old_runtime: Path, version: str) -> Path:
+    tag = f"rust-v{version}"
+    with (package / "codex-package.json").open(encoding="utf-8") as source_file:
+        metadata = json.load(source_file)
+    if metadata.get("version") != version or metadata.get("target") != "x86_64-unknown-linux-gnu":
+        raise RuntimeError("built package version or target does not match the requested release")
+    runtime_name = f"{version}-local-runtime-shared-fork"
+    destination = VERSIONS / runtime_name
+    if destination.exists():
+        raise RuntimeError(f"target runtime already exists: {destination}")
+    stage = Path(tempfile.mkdtemp(prefix=".codex-runtime-", dir=VERSIONS))
+    try:
+        shutil.copytree(package, stage, dirs_exist_ok=True, symlinks=True)
+        old_git = old_runtime / "codex-resources/git"
+        if not old_git.is_dir():
+            raise RuntimeError(f"missing bundled Git resource: {old_git}")
+        # Git installs many hardlinks to its main executable. copytree expands
+        # each one into a separate file; cp -a retains their shared inode.
+        command(["cp", "-a", str(old_git), str(stage / "codex-resources/git")])
+        (stage / "codex-path/git").symlink_to("../codex-resources/git/bin/git")
+        upstream_commit = command(["git", "rev-parse", f"{tag}^{{commit}}"],
+                                  cwd=source, output=True)
+        metadata.update({"upstreamTag": tag, "upstreamCommit": upstream_commit,
+                         "patch": "shared-runtime-persistent-writer-lease",
+                         "gitVersion": "2.55.0"})
+        (stage / "codex-package.json").write_text(
+            json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+        patch = command(["git", "diff", "--binary", tag], cwd=source, output=True)
+        if not patch:
+            raise RuntimeError("ported local patch is empty")
+        (stage / "LOCAL_PATCHES.patch").write_text(patch + "\n", encoding="utf-8")
+        # codex-rs pins its toolchain, so ask rustc from inside the workspace
+        # that cargo built. A query from elsewhere reports the default instead.
+        rustc = command([str(cargo_executable().with_name("rustc")), "--version"],
+                        cwd=source / "codex-rs", output=True)
+        (stage / "BUILD_INFO.md").write_text(
+            f"# Build provenance\n\nCodex: official {tag}, commit {upstream_commit}.\n"
+            f"{rustc}; release profile; target x86_64-unknown-linux-gnu.\n"
+            "LOCAL_PATCHES.patch contains the ported bundle source changes.\n"
+            "The upstream package builder verifies Codex V8 and ripgrep artifacts.\n"
+            f"bwrap SHA-256: {sha256(stage / 'codex-resources/bwrap')}.\n"
+            "Git 2.55.0 and its corresponding source were copied from the previous runtime.\n",
+            encoding="utf-8")
+        observed = command([str(stage / "bin/codex"), "--version"], output=True)
+        if version not in observed:
+            raise RuntimeError(f"built binary reports the wrong version: {observed}")
+        command([str(stage / "codex-path/git"), "--version"])
+        write_manifest(stage)
+        command(["sha256sum", "--check", "--status", "MANIFEST.sha256"], cwd=stage)
+        write_split_archive(stage, runtime_name)
+        os.replace(stage, destination)
+    except Exception:
+        shutil.rmtree(stage, ignore_errors=True)
+        raise
+    activate(destination)
+    return destination
+
+
+def configure_update_environment() -> None:
+    work = BUNDLE / ".work"
+    work.mkdir(mode=0o700, exist_ok=True)
+    temporary = work / "tmp"
+    temporary.mkdir(mode=0o700, exist_ok=True)
+    for name in ("TMPDIR", "TMP", "TEMP"):
+        os.environ[name] = str(temporary)
+    # tempfile caches its default directory after first use.
+    tempfile.tempdir = str(temporary)
+    for name, relative in (("XDG_CACHE_HOME", "cache"), ("UV_CACHE_DIR", "cache/uv"),
+                           ("UV_PYTHON_INSTALL_DIR", "toolchain/python"),
+                           ("CARGO_HOME", "toolchain/cargo")):
+        os.environ.setdefault(name, str(work / relative))
+    if (work / "toolchain/rustup").is_dir():
+        os.environ.setdefault("RUSTUP_HOME", str(work / "toolchain/rustup"))
+    local_pkgconfig = work / "deps/sysroot/usr/lib/x86_64-linux-gnu/pkgconfig"
+    if local_pkgconfig.is_dir():
+        inherited = os.environ.get("PKG_CONFIG_PATH", "")
+        os.environ["PKG_CONFIG_PATH"] = f"{local_pkgconfig}{':' + inherited if inherited else ''}"
+    os.environ.setdefault("CARGO_BUILD_JOBS", "8")
+
+
+def main() -> int:
+    configure_update_environment()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--check", action="store_true", help="report the newest stable release")
+    parser.add_argument("--version", help="install this stable Codex version")
+    parser.add_argument("--rollback", help="reactivate an installed stable version")
+    parser.add_argument("--prepared-source", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--prepared-package", type=Path, help=argparse.SUPPRESS)
+    args = parser.parse_args()
+    if bool(args.prepared_source) != bool(args.prepared_package):
+        parser.error("--prepared-source and --prepared-package must be given together")
+    old_runtime, old_meta = active_runtime()
+    if args.rollback:
+        if args.version or args.check or args.prepared_source:
+            parser.error("--rollback cannot be combined with update options")
+        version = release_version(args.rollback)
+        runtime = VERSIONS / f"{version}-local-runtime-shared-fork"
+        if not runtime.is_dir():
+            raise RuntimeError(f"installed runtime is missing: {runtime}")
+        with UPDATE_LOCK.open("w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            command(["sha256sum", "--check", "--status", "MANIFEST.sha256"], cwd=runtime)
+            activate(runtime)
+        print(f"active: {version}")
+        return 0
+    version = release_version(args.version) if args.version else latest_version()
+    print(f"active: {old_meta['version']}; requested: {version}")
+    if args.check or version == old_meta["version"]:
+        return 0
+    if os.uname().machine != "x86_64" or sys.platform != "linux":
+        raise RuntimeError("this bundle updater currently supports x86_64 Linux only")
+    VERSIONS.mkdir(parents=True, exist_ok=True)
+    work: Path | None = None
+    with UPDATE_LOCK.open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            if args.prepared_source:
+                source = args.prepared_source.resolve(strict=True)
+                package = args.prepared_package.resolve(strict=True)
+            else:
+                (BUNDLE / ".work").mkdir(mode=0o700, exist_ok=True)
+                work = Path(tempfile.mkdtemp(prefix="codex-update-", dir=BUNDLE / ".work"))
+                source = prepare_source(work, old_runtime, old_meta, f"rust-v{version}")
+                package = build_package(work, source, BUNDLE)
+            destination = install(source, package, old_runtime, version)
+            print(f"installed {version}: {destination}")
+        except Exception:
+            if work:
+                print(f"Update stopped; source and build files remain in {work}", file=sys.stderr)
+            raise
+        else:
+            if work:
+                shutil.rmtree(work)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except Exception as error:
+        print(f"update-codex-runtime: {error}", file=sys.stderr)
+        raise SystemExit(1)

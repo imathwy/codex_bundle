@@ -28,6 +28,14 @@ DEFAULT_HANDOFF_MAX_CHARS = 100_000
 DEFAULT_IMPORT_STABLE_SECONDS = 0
 DEFAULT_LOCK_TIMEOUT_SECONDS = 10
 DEFAULT_DB_TIMEOUT_SECONDS = 10
+# Launch-time rollout-path repair competes with every live session writing to
+# the shared state database, so it waits longer than an interactive query.
+DEFAULT_REPAIR_DB_TIMEOUT_SECONDS = 60
+REPAIR_LOCK_WAIT_SECONDS = 2.0
+REPAIR_ATTEMPTS = 3
+# Distinct from a real failure: the repair found the database busy and left
+# the rows for the next launcher instead of blocking this one.
+REPAIR_DEFERRED_EXIT = 75
 HISTORY_SOURCE_REGISTRY_VERSION = 1
 
 
@@ -110,10 +118,52 @@ def history_db_timeout() -> float:
     return timeout
 
 
-def state_db(path: Path) -> sqlite3.Connection:
+def repair_db_timeout() -> float:
+    raw = os.environ.get("CODEX_HISTORY_REPAIR_DB_TIMEOUT_SECONDS")
+    if raw is None:
+        return max(history_db_timeout(), DEFAULT_REPAIR_DB_TIMEOUT_SECONDS)
+    try:
+        timeout = float(raw)
+    except ValueError as error:
+        raise SystemExit(
+            "CODEX_HISTORY_REPAIR_DB_TIMEOUT_SECONDS must be a non-negative number"
+        ) from error
+    if timeout < 0:
+        raise SystemExit(
+            "CODEX_HISTORY_REPAIR_DB_TIMEOUT_SECONDS must be a non-negative number"
+        )
+    return timeout
+
+
+def sqlite_is_busy(error: sqlite3.OperationalError) -> bool:
+    message = str(error).lower()
+    return "locked" in message or "busy" in message
+
+
+def lock_runtime_path_repair(shared: Path, timeout: float):
+    # Every launch of every profile rewrites the same global rows. Hundreds of
+    # concurrent launches turn that into a write-lock pile-up, so one of them
+    # does the work while the rest defer to it.
+    lock = shared / ".repair-runtime-paths.lock"
+    handle = open(lock, "a+")
+    os.chmod(lock, 0o600)
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return handle
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                handle.close()
+                return None
+            time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+
+
+def state_db(path: Path, timeout: float | None = None) -> sqlite3.Connection:
     if not path.is_file():
         raise SystemExit(f"missing Codex state database: {path}")
-    timeout = history_db_timeout()
+    if timeout is None:
+        timeout = history_db_timeout()
     db = sqlite3.connect(path, timeout=timeout)
     db.row_factory = sqlite3.Row
     db.execute(f"PRAGMA busy_timeout={int(timeout * 1000)}")
@@ -433,11 +483,18 @@ def repair_runtime_rollout_paths(
     runtime_root: Path,
     *,
     prune_stale: bool = False,
+    db_timeout: float | None = None,
 ) -> dict[str, int]:
     stats = defaultdict(int)
     sessions = (shared / "sessions").resolve()
     runtime_root = runtime_root.resolve()
-    with state_db(state) as db:
+    with state_db(state, db_timeout) as db:
+        # Scaffolding creates the database before the first Codex launch runs
+        # its migrations. There are no rollout paths to repair at that point.
+        if not db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='threads'"
+        ).fetchone():
+            return stats
         db.execute("PRAGMA foreign_keys=ON")
         rows = db.execute(
             "SELECT id, rollout_path FROM threads WHERE rollout_path LIKE ?",
@@ -473,17 +530,65 @@ def repair_runtime_rollout_paths(
 def cmd_repair_runtime_paths(args) -> None:
     _, shared, state, _ = paths()
     runtime_root = Path(
-        args.runtime_root or f"/var/tmp/codex-profile-runtime-{os.getuid()}"
+        args.runtime_root or os.environ.get("CODEX_RUNTIME_HOME_ROOT")
+        or bundle_root() / f".work/runtime-homes-{os.getuid()}"
     )
-    stats = repair_runtime_rollout_paths(
-        state, shared, runtime_root, prune_stale=args.prune_stale
-    )
+    roots = [runtime_root]
+    # Read old rollout references as well; never create or write a legacy home.
+    legacy_root = Path(f"/var/tmp/codex-profile-runtime-{os.getuid()}")
+    if runtime_root != legacy_root:
+        roots.append(legacy_root)
+    handle = lock_runtime_path_repair(shared, REPAIR_LOCK_WAIT_SECONDS)
+    if handle is None:
+        if not args.quiet:
+            print("runtime rollout paths: another launcher is repairing them")
+        return
+    timeout = repair_db_timeout()
+    try:
+        stats = repair_runtime_paths_with_retry(
+            state, shared, roots, prune_stale=args.prune_stale, db_timeout=timeout
+        )
+    finally:
+        handle.close()
     if not args.quiet or stats["pruned"]:
         print(
             f"runtime rollout paths: normalized={stats['normalized']} "
             f"pruned={stats['pruned']} stale={stats['stale']} "
             f"live_missing={stats['live_missing']}"
         )
+
+
+def repair_runtime_paths_with_retry(
+    state: Path,
+    shared: Path,
+    roots: list[Path],
+    *,
+    prune_stale: bool,
+    db_timeout: float,
+) -> dict[str, int]:
+    for attempt in range(1, REPAIR_ATTEMPTS + 1):
+        stats = defaultdict(int)
+        try:
+            for root in roots:
+                for key, value in repair_runtime_rollout_paths(
+                    state, shared, root, prune_stale=prune_stale, db_timeout=db_timeout
+                ).items():
+                    stats[key] += value
+            return stats
+        except sqlite3.OperationalError as error:
+            if not sqlite_is_busy(error):
+                raise
+            if attempt == REPAIR_ATTEMPTS:
+                # The rows stay valid, and the next launch repairs them. Report a
+                # deferral so the launcher keeps going instead of refusing to run.
+                print(
+                    f"runtime rollout paths: state database stayed busy ({error}); "
+                    "deferred to the next launch",
+                    file=os.sys.stderr,
+                )
+                raise SystemExit(REPAIR_DEFERRED_EXIT) from error
+            time.sleep(min(1.5, 0.2 * attempt * (1 + os.getpid() % 7 / 7)))
+    raise AssertionError("unreachable")
 
 
 def import_source_rollouts(
@@ -640,10 +745,14 @@ def scan_shared_history(
     if not source_codex_home.is_dir():
         raise SystemExit(f"indexing profile has no CODEX_HOME: {source_codex_home}")
 
-    temporary_home = tempfile.TemporaryDirectory(prefix="codex-history-index-")
+    work_root = root / ".work"
+    work_root.mkdir(mode=0o700, exist_ok=True)
+    temporary_home = tempfile.TemporaryDirectory(prefix="codex-history-index-", dir=work_root)
     index_home = Path(temporary_home.name)
     codex_home = index_home / ".codex"
     codex_home.mkdir(mode=0o700)
+    temp_dir = index_home / "tmp"
+    temp_dir.mkdir(mode=0o700)
     config = source_codex_home / "config.toml"
     if config.is_file():
         shutil.copy2(config, codex_home / "config.toml")
@@ -657,6 +766,9 @@ def scan_shared_history(
     environment = os.environ.copy()
     environment.update(
         {
+            "TMPDIR": str(temp_dir),
+            "TMP": str(temp_dir),
+            "TEMP": str(temp_dir),
             "HOME": str(index_home),
             "CODEX_HOME": str(codex_home),
             "CODEX_SHARED_SESSIONS_ROOT": str(shared / "sessions"),
@@ -1576,6 +1688,56 @@ def cmd_auth_identity(args) -> None:
     print(profile_auth_identity(Path(args.auth_file)))
 
 
+def process_is_codex_runtime(process: Path) -> bool:
+    names = {b"codex", b"codex-code-mode-host"}
+    try:
+        executable = os.fsencode(os.readlink(process / "exe"))
+        if executable.removesuffix(b" (deleted)").rsplit(b"/", 1)[-1] in names:
+            return True
+    except OSError:
+        pass
+    # Script launchers may identify the runtime only in their argument vector.
+    try:
+        return any(
+            argument.rsplit(b"/", 1)[-1] in names
+            for argument in (process / "cmdline").read_bytes().split(b"\0")
+        )
+    except OSError:
+        return False
+
+
+def direct_profile_runtime_pids(
+    home: Path, *, proc_root: Path = Path("/proc"), exclude_pid: int | None = None
+) -> list[int]:
+    expected = b"CODEX_HOME=" + os.fsencode(home / ".codex")
+    matches = []
+    with os.scandir(proc_root) as processes:
+        for entry in processes:
+            if not entry.name.isascii() or not entry.name.isdigit():
+                continue
+            pid = int(entry.name)
+            if pid == exclude_pid:
+                continue
+            process = Path(entry.path)
+            if not process_is_codex_runtime(process):
+                continue
+            try:
+                environment = (process / "environ").read_bytes()
+            except OSError:
+                # Processes may exit or become unreadable during the scan.
+                continue
+            if expected in environment.split(b"\0"):
+                matches.append(pid)
+    return sorted(matches)
+
+
+def cmd_direct_runtime_pids(args) -> None:
+    for pid in direct_profile_runtime_pids(
+        Path(args.profile_home), exclude_pid=args.exclude_pid
+    ):
+        print(pid)
+
+
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
     sub = p.add_subparsers(dest="command", required=True)
@@ -1644,6 +1806,10 @@ def parser():
     auth_identity = sub.add_parser("auth-identity")
     auth_identity.add_argument("--auth-file", required=True)
     auth_identity.set_defaults(func=cmd_auth_identity)
+    runtime_pids = sub.add_parser("direct-runtime-pids")
+    runtime_pids.add_argument("--profile-home", required=True)
+    runtime_pids.add_argument("--exclude-pid", type=int)
+    runtime_pids.set_defaults(func=cmd_direct_runtime_pids)
     return p
 
 

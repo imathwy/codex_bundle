@@ -22,6 +22,7 @@ RUNTIME_ROOT="$BUNDLE_ROOT/runtime/codex"
 RUNTIME_CURRENT="$RUNTIME_ROOT/current"
 SHARED_CODEX_ROOT="${CODEX_SHARED_ROOT:-$BUNDLE_ROOT/shared/codex}"
 DEFAULT_TZ="JST-9"
+DEFAULT_MODEL="gpt-6.1-sol"
 
 usage() {
   cat <<'USAGE'
@@ -56,9 +57,14 @@ Environment:
   CODEX_HISTORY_STABLE_SECONDS   minimum age before importing a closed rollout; default: 0
   CODEX_HISTORY_LOCK_TIMEOUT_SECONDS      history maintenance lock wait; default: 10
   CODEX_HISTORY_DB_TIMEOUT_SECONDS        history SQLite busy wait; default: 10
+  CODEX_HISTORY_REPAIR_DB_TIMEOUT_SECONDS launch-time rollout-path repair wait; default: 60
   CODEX_HISTORY_PREPARE_INTERVAL_SECONDS  reuse successful resume prep; default: 60
   CODEX_AUTO_HISTORY_MAINTENANCE=1        opt in to blocking resume-time history prep
   CODEX_RUNTIME_CACHE_LOCK_TIMEOUT_SECONDS runtime cache lock wait; default: 30
+  CODEX_RUNTIME_HOME_ROOT        default: $CODEX_BUNDLE_ROOT/.work/runtime-homes-<uid>
+  CODEX_RUNTIME_HOME_LOCK_TIMEOUT_SECONDS runtime-state merge lock wait; default: 30
+  CODEX_PROFILE_STATE_LOCK_TIMEOUT_SECONDS trusted-state/profile-file lock wait; default: 30
+  CODEX_RUNTIME_CACHE_ROOT       default: $CODEX_BUNDLE_ROOT/.work/runtime-cache-<uid>
   CODEX_ALLOW_PROXY=1            allow proxy environment variables
   CODEX_ALLOW_EXTERNAL_RUNTIME=1 allow CODEX_REAL_BIN outside this bundle
   CODEX_ALLOW_ENV_OVERRIDES=1    allow OpenAI/provider/auth environment overrides
@@ -66,6 +72,11 @@ Environment:
   CODEX_ALLOW_AUTH_IDENTITY_CHANGE=1 allow a non-login launch to switch accounts
   CODEX_ALLOW_PROFILE_CONFIG_CHANGE=1 allow Codex to persist config.toml changes
   CODEX_PROFILE_GUARD_POLL_SECONDS profile auth/config guard interval; default: 0.5
+  CODEX_PROFILE_GUARD_SWEEP_INTERVAL_SECONDS stale guard-dir sweep interval; default: 300
+  CODEX_PROFILE_GUARD_SWEEP_BUDGET directories examined per sweep; default: 400
+  CODEX_PROFILE_GUARD_STALE_AGE age (date -d) past which an unowned guard dir is stale; default: 4 days
+  CODEX_PROFILE_GUARD_HEARTBEAT_SECONDS live guard-dir mtime refresh interval; default: 600
+  CODEX_PROFILE_GUARD_LOCK_TIMEOUT_SECONDS profile auth/config guard lock wait; default: 20
 
 Model:
   Account credentials and config have a protected per-profile baseline. Runtime copies
@@ -260,12 +271,12 @@ args = [\"lean-lsp-mcp\"]"
   command -v flock >/dev/null 2>&1 || die "flock is required for profile config protection"
   exec {config_lock_fd}>"$home/.codex/config.lock"
   chmod 600 "$home/.codex/config.lock" 2>/dev/null || true
-  if ! flock -w 5 "$config_lock_fd"; then
+  if ! flock -w "${CODEX_PROFILE_STATE_LOCK_TIMEOUT_SECONDS:-30}" "$config_lock_fd"; then
     exec {config_lock_fd}>&-
     die "timed out waiting for profile config lock: $config"
   fi
   if [ ! -e "$config" ]; then
-    printf "%s\n" "$block" > "$config"
+    printf 'model = "%s"\n\n%s\n' "$DEFAULT_MODEL" "$block" > "$config"
   elif [ -f "$config" ] && ! grep -Eq '^\[mcp_servers\.lean-lsp\]|^[[:space:]]*lean-lsp[[:space:]]*=' "$config"; then
     printf "\n%s\n" "$block" >> "$config"
   fi
@@ -286,6 +297,11 @@ lean_mcp_configured() {
 
 find_lean_mcp_runner() {
   local home="$1" host_home="${2:-${HOME:-}}" runner
+  runner="$BIN_DIR/uvx"
+  if [ -x "$runner" ]; then
+    printf '%s\n' "$runner"
+    return 0
+  fi
   runner="$home/.local/bin/uvx"
   if [ -x "$runner" ]; then
     printf '%s\n' "$runner"
@@ -335,13 +351,14 @@ ensure_profile_scaffold() {
 ensure_shared_state() {
   local name
   mkdir -p "$SHARED_CODEX_ROOT"
-  for name in sessions archived_sessions shell_snapshots; do
+  for name in sessions archived_sessions shell_snapshots thread-writer-locks; do
     mkdir -p "$SHARED_CODEX_ROOT/$name"
   done
   touch "$SHARED_CODEX_ROOT/history.jsonl" "$SHARED_CODEX_ROOT/session_index.jsonl"
   chmod 700 "$BUNDLE_ROOT/shared" "$SHARED_CODEX_ROOT" \
     "$SHARED_CODEX_ROOT/sessions" "$SHARED_CODEX_ROOT/archived_sessions" \
-    "$SHARED_CODEX_ROOT/shell_snapshots" 2>/dev/null || true
+    "$SHARED_CODEX_ROOT/shell_snapshots" \
+    "$SHARED_CODEX_ROOT/thread-writer-locks" 2>/dev/null || true
   chmod 600 "$SHARED_CODEX_ROOT/history.jsonl" "$SHARED_CODEX_ROOT/session_index.jsonl" 2>/dev/null || true
 }
 
@@ -509,7 +526,7 @@ ensure_shared_memory() {
   reject_shared_symlinks
   ensure_profile_scaffold "$home"
   ensure_shared_state
-  for name in sessions archived_sessions shell_snapshots; do
+  for name in sessions archived_sessions shell_snapshots thread-writer-locks; do
     link_shared_dir "$codex_home" "$name" "$mode"
   done
   link_shared_history "$codex_home" "$mode"
@@ -545,11 +562,12 @@ profile_symlink_target_allowed() {
     tmp/arg0/codex-arg*/apply_patch|tmp/arg0/codex-arg*/applypatch|\
     tmp/arg0/codex-arg*/codex-execve-wrapper|tmp/arg0/codex-arg*/codex-linux-sandbox)
       if path_under_resolved "$target" "$runtime_root" ||
-        path_under_resolved "$target" "$runtime_cache_root"; then
+        path_under_resolved "$target" "$runtime_cache_root" ||
+        path_under_resolved "$target" "/tmp/codex-bundle-runtime-cache-$(id -u)"; then
         return 0
       fi
       ;;
-    sessions|archived_sessions|shell_snapshots|history.jsonl|session_index.jsonl)
+    sessions|archived_sessions|shell_snapshots|thread-writer-locks|history.jsonl|session_index.jsonl)
       path_under_resolved "$target" "$shared_root" && return 0
       ;;
     *.sqlite)
@@ -560,7 +578,23 @@ profile_symlink_target_allowed() {
   if uv_cache_python_link_allowed "$root" "$link" "$target"; then
     return 0
   fi
+  if workspace_python_link_allowed "$root" "$link" "$target"; then
+    return 0
+  fi
   path_under_resolved "$target" "$root"
+}
+
+workspace_python_link_allowed() {
+  local root="$1" link="$2" target="$3" name workspace_root
+  case "$link" in
+    "$root/.local/bin/"*) name="${link#"$root/.local/bin/"}" ;;
+    *) return 1 ;;
+  esac
+  [[ "$name" =~ ^python([0-9]+(\.[0-9]+)*)?$ ]] || return 1
+  [[ "${target##*/}" =~ ^python([0-9]+(\.[0-9]+)*)?$ ]] || return 1
+  workspace_root="$(resolve_path "$BUNDLE_ROOT/..")"
+  path_under_resolved "$target" "$workspace_root" &&
+    [ -f "$target" ] && [ -x "$target" ]
 }
 
 uv_cache_python_link_allowed() {
@@ -599,7 +633,7 @@ check_escaping_symlinks() {
   root="$(resolve_path "$root")"
   runtime_root="$(resolve_path "$RUNTIME_ROOT")"
   shared_root="$(resolve_path "$SHARED_CODEX_ROOT")"
-  runtime_cache_root="$(resolve_path "${CODEX_RUNTIME_CACHE_ROOT:-/tmp/codex-bundle-runtime-cache-$(id -u)}")"
+  runtime_cache_root="$(resolve_path "${CODEX_RUNTIME_CACHE_ROOT:-$BUNDLE_ROOT/.work/runtime-cache-$(id -u)}")"
   if [ -n "$maxdepth" ]; then
     while IFS= read -r link; do
       target="$(resolve_path "$link")"
@@ -646,7 +680,10 @@ proxy_env_lines() {
 override_env_lines() {
   env | awk -F= '{
     name=$1; uname=toupper(name)
-    if (uname ~ /^CODEX_(BUNDLE_ROOT|PROFILES_ROOT|ACTIVE_PROFILE_LINK|SHARED_ROOT|REAL_BIN|TZ|HISTORY_KEEP_DAYS|HISTORY_STABLE_SECONDS|HISTORY_LOCK_TIMEOUT_SECONDS|HISTORY_DB_TIMEOUT_SECONDS|HISTORY_PREPARE_INTERVAL_SECONDS|AUTO_HISTORY_MAINTENANCE|RUNTIME_CACHE_LOCK_TIMEOUT_SECONDS|RUNTIME_CACHE_ROOT|USE_LOCAL_RUNTIME_CACHE|ALLOW_DUPLICATE_SESSION|ALLOW_DIRECT_PROFILE_RUNTIME|ALLOW_AUTH_IDENTITY_CHANGE|ALLOW_PROFILE_CONFIG_CHANGE|PROFILE_GUARD_POLL_SECONDS|ALLOW_PROXY|ALLOW_EXTERNAL_RUNTIME|ALLOW_ENV_OVERRIDES|HOME|THREAD_ID|SESSION_ID|CI|MANAGED_BY_NPM|MANAGED_PACKAGE_ROOT|PERMISSION_PROFILE|SANDBOX_NETWORK_DISABLED|PROFILE_PRESERVE_MODEL_CONFIG)$/) next
+    # Runtime metadata inherited from a parent Codex session is not a provider
+    # override. Shared session/log paths and plugin sync are reset at launch.
+    if (uname ~ /^CODEX_(VERSION|SHARED_SESSIONS_ROOT|LOG_DB_PATH|DISABLE_STARTUP_PLUGIN_SYNC|APPLY_PATCH_PRESERVE_LINE_ENDINGS)$/) next
+    if (uname ~ /^CODEX_(BUNDLE_ROOT|PROFILES_ROOT|ACTIVE_PROFILE_LINK|SHARED_ROOT|REAL_BIN|TZ|HISTORY_KEEP_DAYS|HISTORY_STABLE_SECONDS|HISTORY_LOCK_TIMEOUT_SECONDS|HISTORY_DB_TIMEOUT_SECONDS|HISTORY_REPAIR_DB_TIMEOUT_SECONDS|HISTORY_PREPARE_INTERVAL_SECONDS|AUTO_HISTORY_MAINTENANCE|RUNTIME_CACHE_LOCK_TIMEOUT_SECONDS|RUNTIME_CACHE_ROOT|RUNTIME_HOME_ROOT|RUNTIME_HOME_LOCK_TIMEOUT_SECONDS|PROFILE_STATE_LOCK_TIMEOUT_SECONDS|USE_LOCAL_RUNTIME_CACHE|ALLOW_DUPLICATE_SESSION|ALLOW_DIRECT_PROFILE_RUNTIME|ALLOW_AUTH_IDENTITY_CHANGE|ALLOW_PROFILE_CONFIG_CHANGE|PROFILE_GUARD_POLL_SECONDS|PROFILE_GUARD_LOCK_TIMEOUT_SECONDS|ALLOW_PROXY|ALLOW_EXTERNAL_RUNTIME|ALLOW_ENV_OVERRIDES|HOME|THREAD_ID|SESSION_ID|TOOL_CALL_ID|CI|MANAGED_BY_NPM|MANAGED_PACKAGE_ROOT|PERMISSION_PROFILE|SANDBOX_NETWORK_DISABLED|PROFILE_PRESERVE_MODEL_CONFIG)$/) next
     if (uname ~ /^(OPENAI_|CODEX_|AZURE_OPENAI_|AZURE_|AWS_|GOOGLE_APPLICATION_CREDENTIALS$|GOOGLE_CLOUD_)/) print name"=<set>"
   }'
 }
@@ -662,49 +699,10 @@ require_safe_env() {
   fi
 }
 
-process_environment_has_entry() {
-  local environment_file="$1" expected="$2" entry
-  while IFS= read -r -d '' entry; do
-    if [ "$entry" = "$expected" ]; then
-      return 0
-    fi
-  done < "$environment_file" 2>/dev/null
-  return 1
-}
-
-process_is_codex_runtime() {
-  local pid="$1" executable argument name
-  if [ -r "/proc/$pid/exe" ]; then
-    executable="$(readlink "/proc/$pid/exe" 2>/dev/null || true)"
-    name="${executable##*/}"
-    name="${name% (deleted)}"
-    case "$name" in
-      codex|codex-code-mode-host) return 0 ;;
-    esac
-  fi
-  while IFS= read -r -d '' argument; do
-    name="${argument##*/}"
-    case "$name" in
-      codex|codex-code-mode-host) return 0 ;;
-    esac
-  done < "/proc/$pid/cmdline" 2>/dev/null
-  return 1
-}
-
 direct_profile_runtime_pids() {
-  local home="$1" environment_file pid
-  local expected
-  expected="CODEX_HOME=$home/.codex"
-  for environment_file in /proc/[0-9]*/environ; do
-    [ -r "$environment_file" ] || continue
-    pid="${environment_file#/proc/}"
-    pid="${pid%/environ}"
-    [ "$pid" != "$$" ] || continue
-    process_is_codex_runtime "$pid" || continue
-    if process_environment_has_entry "$environment_file" "$expected"; then
-      printf '%s\n' "$pid"
-    fi
-  done
+  # One process-table scan avoids thousands of readlink subprocesses and Bash
+  # environment reads on hosts running many concurrent Codex sessions.
+  "$BIN_DIR/codex-history" direct-runtime-pids --profile-home "$1" --exclude-pid "$$"
 }
 
 direct_profile_runtime_guard() {
@@ -715,7 +713,8 @@ direct_profile_runtime_guard() {
     1) return 0 ;;
     *) die "CODEX_ALLOW_DIRECT_PROFILE_RUNTIME must be 0 or 1" ;;
   esac
-  pids="$(direct_profile_runtime_pids "$home" | paste -sd, -)"
+  pids="$(direct_profile_runtime_pids "$home" | paste -sd, -)" ||
+    die "could not inspect processes using the persistent CODEX_HOME"
   if [ -n "$pids" ]; then
     die "profile $(basename "$home") still has processes using its persistent CODEX_HOME (PIDs: $pids);" \
       "exit those old or bypassing Codex processes before launching"
@@ -833,7 +832,7 @@ local_runtime_launcher() {
   fi
   version_dir="$(dirname "$(dirname "$launcher")")"
   version_name="$(basename "$version_dir")"
-  cache_root="${CODEX_RUNTIME_CACHE_ROOT:-/tmp/codex-bundle-runtime-cache-$(id -u)}"
+  cache_root="${CODEX_RUNTIME_CACHE_ROOT:-$BUNDLE_ROOT/.work/runtime-cache-$(id -u)}"
   cache_dir="$cache_root/$version_name"
   mkdir -p "$cache_root"
   chmod 700 "$cache_root" 2>/dev/null || true
@@ -879,7 +878,8 @@ runtime_home_entry_is_protected() {
   case "$1" in
     auth.json|auth.json.*|.auth.json.*|auth.lock|\
     config.toml|config.toml.*|.config.toml.*|config.lock|\
-    .auth-guard.*|.config-guard.*|.runtime-state.*|runtime-home.lock)
+    .auth-guard.*|.config-guard.*|.runtime-state.*|.bundle-auth-sync.json|\
+    ..bundle-auth-sync.json.*|runtime-home.lock|AGENTS.override.md)
       return 0 ;;
     *) return 1 ;;
   esac
@@ -888,7 +888,7 @@ runtime_home_entry_is_protected() {
 runtime_codex_home_root() {
   local root owner uid
   uid="$(id -u)"
-  root="/var/tmp/codex-profile-runtime-$uid"
+  root="${CODEX_RUNTIME_HOME_ROOT:-$BUNDLE_ROOT/.work/runtime-homes-$uid}"
   [ ! -L "$root" ] || die "runtime-home root must not be a symlink: $root"
   mkdir -p "$root"
   [ -d "$root" ] && [ ! -L "$root" ] ||
@@ -927,6 +927,10 @@ cleanup_runtime_codex_home() {
 cleanup_runtime_codex_home_on_exit() {
   local runtime_home="$RUNTIME_CODEX_HOME_TO_CLEAN"
   RUNTIME_CODEX_HOME_TO_CLEAN=""
+  if [ -n "$runtime_home" ] && [ -f "$runtime_home/.bundle-auth-sync.json" ]; then
+    "$BIN_DIR/codex-auth" sync --profile-home "$HOME" \
+      --runtime-home "$runtime_home" || note "could not save runtime auth during cleanup"
+  fi
   cleanup_runtime_codex_home "$runtime_home" || true
 }
 
@@ -949,8 +953,22 @@ prepare_runtime_codex_home() {
     fi
   done < <(find "$source" -mindepth 1 -maxdepth 1 -print0)
 
+  # Preserve the profile's selected global instructions and append bundle policy.
+  if [ -s "$BUNDLE_ROOT/AGENTS.md" ]; then
+    if [ -s "$source/AGENTS.override.md" ]; then
+      cat "$source/AGENTS.override.md" > "$runtime_home/AGENTS.override.md"
+    elif [ -s "$source/AGENTS.md" ]; then
+      cat "$source/AGENTS.md" > "$runtime_home/AGENTS.override.md"
+    fi
+    printf '\n' >> "$runtime_home/AGENTS.override.md"
+    cat "$BUNDLE_ROOT/AGENTS.md" >> "$runtime_home/AGENTS.override.md"
+    chmod 600 "$runtime_home/AGENTS.override.md"
+  elif [ -f "$source/AGENTS.override.md" ]; then
+    cp "$source/AGENTS.override.md" "$runtime_home/AGENTS.override.md"
+  fi
+
   exec {state_lock_fd}>"$home/.codex-profile-state.lock"
-  if ! flock -w 5 "$state_lock_fd"; then
+  if ! flock -w "${CODEX_PROFILE_STATE_LOCK_TIMEOUT_SECONDS:-30}" "$state_lock_fd"; then
     exec {state_lock_fd}>&-
     cleanup_runtime_codex_home "$runtime_home" || true
     die "timed out reading trusted profile state"
@@ -979,13 +997,39 @@ prepare_runtime_codex_home() {
   printf '%s\n' "$runtime_home"
 }
 
+runtime_command() {
+  # Login/logout can follow global CLI options. Do not interpret option values
+  # (or a prompt after --) as authorization to change the profile identity.
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --) return 0 ;;
+      -c|--config|-m|--model|-p|--profile|-C|--cd|-a|--ask-for-approval|-s|--sandbox|\
+      -i|--image|--add-dir|--enable|--disable|--remote)
+        [ "$#" -ge 2 ] || return 0
+        shift 2 ;;
+      -*) shift ;;
+      *) printf '%s\n' "$1"; return 0 ;;
+    esac
+  done
+}
+
 launch_codex_process() {
   local launcher="$1" lean_project="$2" override
-  local -a config_args=()
+  local -a config_args=(-c 'tui.alternate_screen="never"' -c 'tui.raw_output_mode=false'
+    -c 'cli_auth_credentials_store="file"')
   shift 2
   if [ -n "$lean_project" ]; then
     override="mcp_servers.lean-lsp.env.LEAN_PROJECT_PATH=$(toml_string "$lean_project")"
-    config_args=(-c "$override")
+    config_args+=(-c "$override")
+  fi
+  # Runtime homes are per-process: never start a shared background daemon.
+  # The embedded server exits with the interactive client.
+  local arg has_no_daemon=0
+  for arg in "$@"; do
+    [ "$arg" != --no-daemon ] || has_no_daemon=1
+  done
+  if [ "$has_no_daemon" = 0 ]; then
+    config_args+=(--no-daemon)
   fi
   if [ "${CODEX_SESSION_LOCKED:-0}" = 1 ]; then
     "$launcher" "${config_args[@]}" "$@" 9>&-
@@ -1107,7 +1151,7 @@ ensure_trusted_profile_state() {
     die "flock is required for trusted profile state"
   exec {state_lock_fd}>"$lock"
   chmod 600 "$lock" 2>/dev/null || true
-  if ! flock -w 5 "$state_lock_fd"; then
+  if ! flock -w "${CODEX_PROFILE_STATE_LOCK_TIMEOUT_SECONDS:-30}" "$state_lock_fd"; then
     exec {state_lock_fd}>&-
     die "timed out waiting for trusted profile state lock: $lock"
   fi
@@ -1166,7 +1210,7 @@ persist_trusted_profile_file() {
   lock="$home/.codex-profile-state.lock"
   exec {state_lock_fd}>"$lock" || return 1
   chmod 600 "$lock" 2>/dev/null || true
-  if ! flock -w 5 "$state_lock_fd"; then
+  if ! flock -w "${CODEX_PROFILE_STATE_LOCK_TIMEOUT_SECONDS:-30}" "$state_lock_fd"; then
     exec {state_lock_fd}>&-
     return 1
   fi
@@ -1194,7 +1238,7 @@ remove_trusted_profile_file() {
   lock="$home/.codex-profile-state.lock"
   exec {state_lock_fd}>"$lock" || return 1
   chmod 600 "$lock" 2>/dev/null || true
-  if ! flock -w 5 "$state_lock_fd"; then
+  if ! flock -w "${CODEX_PROFILE_STATE_LOCK_TIMEOUT_SECONDS:-30}" "$state_lock_fd"; then
     exec {state_lock_fd}>&-
     return 1
   fi
@@ -1219,7 +1263,7 @@ persist_runtime_file() {
   [ -f "$source" ] && [ ! -L "$source" ] || return 1
   exec {lock_fd}>"$lock" || return 1
   chmod 600 "$lock" 2>/dev/null || true
-  if ! flock -w 5 "$lock_fd"; then
+  if ! flock -w "${CODEX_PROFILE_STATE_LOCK_TIMEOUT_SECONDS:-30}" "$lock_fd"; then
     exec {lock_fd}>&-
     return 1
   fi
@@ -1233,7 +1277,7 @@ remove_runtime_profile_file() {
   local target="$1" lock="$2" lock_fd result=0
   exec {lock_fd}>"$lock" || return 1
   chmod 600 "$lock" 2>/dev/null || true
-  if ! flock -w 5 "$lock_fd"; then
+  if ! flock -w "${CODEX_PROFILE_STATE_LOCK_TIMEOUT_SECONDS:-30}" "$lock_fd"; then
     exec {lock_fd}>&-
     return 1
   fi
@@ -1267,9 +1311,13 @@ merge_runtime_codex_state() {
   source="$home/.codex"
   exec {lock_fd}>"$source/runtime-home.lock" || return 1
   chmod 600 "$source/runtime-home.lock" 2>/dev/null || true
-  if ! flock -w 5 "$lock_fd"; then
+  if ! flock -w "${CODEX_RUNTIME_HOME_LOCK_TIMEOUT_SECONDS:-30}" "$lock_fd"; then
     exec {lock_fd}>&-
-    return 1
+    # Every session of this profile merges here when it exits. What is left
+    # behind is the runtime's own regenerable state, so report the contention
+    # instead of failing a launch that already finished its work.
+    note "skipped merging isolated runtime state: $source/runtime-home.lock stayed busy"
+    return 0
   fi
   while IFS= read -r -d '' entry; do
     name="${entry##*/}"
@@ -1302,19 +1350,15 @@ merge_runtime_codex_state() {
 }
 
 finalize_runtime_codex_home() {
-  local home="$1" runtime_home="$2" command="$3" auth_before="$4"
-  local expected_auth_identity="$5" config_before="$6"
-  local trusted_auth="$home/.codex-profile-state/auth.json"
-  local runtime_auth="$runtime_home/auth.json" runtime_config="$runtime_home/config.toml"
-  local auth_after config_after current_auth current_digest tool launch_kind
-  local allow_auth allow_config result=0
-  tool="$BIN_DIR/codex-history"
-  allow_auth="${CODEX_ALLOW_AUTH_IDENTITY_CHANGE:-0}"
+  local home="$1" runtime_home="$2" command="$3" config_before="$4"
+  local runtime_config="$runtime_home/config.toml" config_after launch_kind
+  local allow_config result=0
   allow_config="${CODEX_ALLOW_PROFILE_CONFIG_CHANGE:-0}"
   launch_kind="$command"
   [ -n "$launch_kind" ] || launch_kind=interactive
 
   if ! merge_runtime_codex_state "$home" "$runtime_home"; then
+    note "could not merge isolated runtime state into the profile"
     result=1
   fi
 
@@ -1337,39 +1381,9 @@ finalize_runtime_codex_home() {
     fi
   fi
 
-  auth_after="$(runtime_file_digest "$runtime_auth")"
-  if [ "$auth_after" != "$auth_before" ]; then
-    if [ "$allow_auth" = 1 ] || [ "$command" = login ] ||
-      [ "$command" = logout ] || [ "$auth_before" = missing ]; then
-      if [ "$auth_after" = missing ]; then
-        if ! remove_trusted_profile_file "$home" auth.json; then
-          note "could not persist trusted auth removal"
-          result=1
-        fi
-      elif [ "$auth_after" = unsupported ] ||
-        ! "$tool" auth-identity --auth-file "$runtime_auth" >/dev/null 2>&1 ||
-        ! persist_trusted_profile_file "$home" auth.json "$runtime_auth" 600; then
-        note "could not persist trusted auth update"
-        result=1
-      fi
-    elif [ "$auth_after" = missing ] || [ "$auth_after" = unsupported ]; then
-      note "discarded isolated auth removal or invalid replacement during $launch_kind launch"
-    else
-      current_auth="$("$tool" auth-identity --auth-file "$runtime_auth" 2>/dev/null || printf invalid)"
-      if [ "$current_auth" != "$expected_auth_identity" ]; then
-        note "discarded isolated auth identity change during $launch_kind launch"
-        note "use login/logout or CODEX_ALLOW_AUTH_IDENTITY_CHANGE=1 to change this profile's account"
-      else
-        current_digest="$(runtime_file_digest "$trusted_auth")"
-        if [ "$current_digest" != "$auth_before" ] &&
-          [ "$("$tool" auth-identity --auth-file "$trusted_auth" 2>/dev/null || printf invalid)" = "$expected_auth_identity" ]; then
-          note "kept a newer trusted same-account auth refresh from another profile process"
-        elif ! persist_trusted_profile_file "$home" auth.json "$runtime_auth" 600; then
-          note "could not persist trusted same-account auth refresh"
-          result=1
-        fi
-      fi
-    fi
+  if ! "$BIN_DIR/codex-auth" sync --profile-home "$home" --runtime-home "$runtime_home"; then
+    note "could not persist isolated runtime auth"
+    result=1
   fi
   ensure_trusted_profile_state "$home"
   return "$result"
@@ -1380,7 +1394,7 @@ guard_config_once() {
   config="$home/.codex/config.toml"
   exec {lock_fd}>"$home/.codex/config.lock" || return 20
   chmod 600 "$home/.codex/config.lock" 2>/dev/null || true
-  if ! flock -w 1 "$lock_fd"; then
+  if ! flock -w "${CODEX_PROFILE_GUARD_LOCK_TIMEOUT_SECONDS:-20}" "$lock_fd"; then
     exec {lock_fd}>&-
     return 20
   fi
@@ -1398,13 +1412,46 @@ guard_config_once() {
 
 guard_auth_once() {
   local home="$1" backup="$2" expected="$3" tool="$4"
-  local auth current next lock_fd result=0
+  local auth current next lock_fd baseline="$backup" result=0
   auth="$home/.codex/auth.json"
   exec {lock_fd}>"$home/.codex/auth.lock" || return 20
   chmod 600 "$home/.codex/auth.lock" 2>/dev/null || true
-  if ! flock -w 1 "$lock_fd"; then
+  if ! flock -w "${CODEX_PROFILE_GUARD_LOCK_TIMEOUT_SECONDS:-20}" "$lock_fd"; then
     exec {lock_fd}>&-
     return 20
+  fi
+  if [ -f "$home/.codex-profile-state/auth.json" ] &&
+    [ ! -L "$home/.codex-profile-state/auth.json" ]; then
+    baseline="$home/.codex-profile-state/auth.json"
+  elif [ -f "$home/.codex-profile-state/auth.json.missing" ]; then
+    baseline=""
+  fi
+  if [ -n "$baseline" ] && [ -f "$auth" ] && [ ! -L "$auth" ] &&
+    cmp -s -- "$baseline" "$auth"; then
+    # The guarded copy holds the expected identity, so identical bytes need no
+    # identity check. Skipping it keeps this lock, which every session of the
+    # profile takes, held for a comparison instead of a process launch.
+    flock -u "$lock_fd" 2>/dev/null || true
+    exec {lock_fd}>&-
+    return 0
+  fi
+  if [ -d "$home/.codex-profile-state" ] && [ ! -L "$home/.codex-profile-state" ]; then
+    # Trusted files are replaced atomically. Avoid taking the state lock while
+    # holding auth.lock; writers always acquire those locks in the reverse order.
+    local trusted="$home/.codex-profile-state/auth.json"
+    if [ -f "$trusted" ] && [ ! -L "$trusted" ]; then
+      if cp -p -- "$trusted" "$backup.next" && chmod 600 "$backup.next" &&
+        mv -f -- "$backup.next" "$backup"; then
+        expected="$("$tool" auth-identity --auth-file "$backup" 2>/dev/null || printf invalid)"
+      else
+        exec {lock_fd}>&-
+        return 20
+      fi
+    elif [ -f "$home/.codex-profile-state/auth.json.missing" ]; then
+      rm -f -- "$auth"
+      exec {lock_fd}>&-
+      return 0
+    fi
   fi
   current="invalid"
   if [ -f "$auth" ] && [ ! -L "$auth" ]; then
@@ -1433,7 +1480,8 @@ guard_auth_once() {
 
 guard_profile_once() {
   local home="$1" auth_backup="$2" auth_identity="$3"
-  local config_backup="$4" command="$5" tool="$BIN_DIR/codex-history" result
+  local config_backup="$4" command="$5" quiet="${6:-0}"
+  local tool="$BIN_DIR/codex-history" result status=0
   if [ -n "$config_backup" ]; then
     if guard_config_once "$home" "$config_backup"; then
       :
@@ -1443,7 +1491,8 @@ guard_profile_once() {
         note "blocked profile config overwrite during ${command:-interactive} launch"
         note "set CODEX_ALLOW_PROFILE_CONFIG_CHANGE=1 only for an intentional config change"
       else
-        note "could not verify profile config guard; it will retry"
+        status=1
+        [ "$quiet" = 1 ] || note "could not verify profile config guard; it will retry"
       fi
     fi
   fi
@@ -1456,11 +1505,31 @@ guard_profile_once() {
         note "restored profile auth after account identity changed during ${command:-interactive} launch"
         note "use login/logout or CODEX_ALLOW_AUTH_IDENTITY_CHANGE=1 to change this profile's account"
       else
-        note "could not verify profile auth guard; it will retry"
+        status=1
+        [ "$quiet" = 1 ] || note "could not verify profile auth guard; it will retry"
       fi
     fi
   fi
-  return 0
+  return "$status"
+}
+
+guard_profile_until_verified() {
+  local home="$1" auth_backup="$2" auth_identity="$3"
+  local config_backup="$4" command="$5" attempt
+  # Sibling sessions release these locks when they finalize, which is exactly
+  # when the last check of this session runs. No watcher is left to repeat it,
+  # so wait for a verdict here instead of reporting a contested guard.
+  for attempt in 1 2 3; do
+    if guard_profile_once "$home" "$auth_backup" "$auth_identity" \
+      "$config_backup" "$command" 1; then
+      return 0
+    fi
+    # Jitter: sibling sessions lose the same lock at the same moment, and a
+    # fixed sleep makes them collide again on every retry.
+    sleep "0.$((RANDOM % 5 + 1))"
+  done
+  guard_profile_once "$home" "$auth_backup" "$auth_identity" \
+    "$config_backup" "$command" 0
 }
 
 guarded_file_signature() {
@@ -1472,6 +1541,78 @@ guarded_file_signature() {
   fi
 }
 
+guard_host_marker() {
+  # Guard roots live on a shared filesystem, so /proc answers only for guard
+  # directories created under this kernel boot and hostname; a container with
+  # its own pid namespace reports a different hostname.
+  local name boot
+  name="$(hostname 2>/dev/null)" || name=""
+  [ -n "$name" ] || name="$(cat /proc/sys/kernel/hostname 2>/dev/null || printf unknown)"
+  boot="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)"
+  printf '%s:%s\n' "$name" "$boot"
+}
+
+write_profile_guard_owner() {
+  local guard_dir="$1" owner_pid="$2"
+  printf '%s\n' "$owner_pid" > "$guard_dir/owner.pid" 2>/dev/null || true
+  chmod 600 "$guard_dir/owner.pid" 2>/dev/null || true
+  guard_host_marker > "$guard_dir/owner.host" 2>/dev/null || true
+  chmod 600 "$guard_dir/owner.host" 2>/dev/null || true
+}
+
+sweep_stale_guard_dirs() {
+  # A guard directory holds a copy of auth.json, so a session killed before its
+  # cleanup leaks credential material and grows the directory that every launch
+  # creates its own temp dir in. Each directory records its owner pid and host
+  # marker. The root is on a shared filesystem, so /proc proves an owner dead
+  # only when the marker matches this host; every other directory is judged by
+  # age alone, which live watchers defeat by refreshing their directory mtime.
+  # The sweep is throttled per root, bounded, and takes its lock non-blocking:
+  # concurrent launches skip it instead of queueing.
+  local root="$1" stamp ref lock_fd now mark dir owner budget stale host me
+  me="$(guard_host_marker)"
+  stamp="$root/.guard-sweep.stamp"
+  ref="$root/.guard-sweep.cutoff"
+  budget="${CODEX_PROFILE_GUARD_SWEEP_BUDGET:-400}"
+  now="$(date +%s)"
+  mark="$(cat "$stamp" 2>/dev/null || true)"
+  [[ "$mark" =~ ^[0-9]+$ ]] || mark=0
+  [ "$((now - mark))" -ge "${CODEX_PROFILE_GUARD_SWEEP_INTERVAL_SECONDS:-300}" ] || return 0
+  exec {lock_fd}>"$root/.guard-sweep.lock" || return 0
+  if ! flock -n "$lock_fd"; then
+    exec {lock_fd}>&-
+    return 0
+  fi
+  printf '%s\n' "$now" > "$stamp" 2>/dev/null || true
+  # Reference file for the age test, so the loop spawns no process per directory.
+  touch -d "${CODEX_PROFILE_GUARD_STALE_AGE:-4 days} ago" "$ref" 2>/dev/null || : > "$ref"
+  for dir in "$root"/codex-profile-guard.*; do
+    [ "$budget" -gt 0 ] || break
+    [ -d "$dir" ] || continue
+    budget=$((budget - 1))
+    stale=0
+    owner="$(cat "$dir/owner.pid" 2>/dev/null || true)"
+    host="$(cat "$dir/owner.host" 2>/dev/null || true)"
+    if [ -n "$host" ] && [ "$host" = "$me" ] && [[ "$owner" =~ ^[0-9]+$ ]]; then
+      # Only this host's /proc can prove this owner dead; a foreign session's
+      # pid is meaningless here and once deleted a live session's directory
+      # fails every snapshot update until its watcher recreates it.
+      [ -d "/proc/$owner" ] || stale=1
+    fi
+    # Pid reuse, foreign hosts, and directories from before the markers
+    # existed: fall back to an age the heartbeat keeps live sessions under.
+    if [ -e "$ref" ] && [ "$dir" -ot "$ref" ]; then
+      stale=1
+    fi
+    [ "$stale" -eq 1 ] || continue
+    rm -f -- "$dir/auth.json" "$dir/auth.json.next" "$dir/config.toml" "$dir/owner.pid" "$dir/owner.host" 2>/dev/null || true
+    rmdir -- "$dir" 2>/dev/null || true
+  done
+  flock -u "$lock_fd" 2>/dev/null || true
+  exec {lock_fd}>&-
+  return 0
+}
+
 cleanup_profile_guard() {
   local guard_dir="$1" auth_backup="$2" config_backup="$3"
   if [ -n "$auth_backup" ]; then
@@ -1480,48 +1621,101 @@ cleanup_profile_guard() {
   if [ -n "$config_backup" ]; then
     rm -f -- "$config_backup"
   fi
+  rm -f -- "$guard_dir/owner.pid" "$guard_dir/owner.host"
   rmdir -- "$guard_dir" 2>/dev/null || true
 }
 
 watch_profile_guard() {
   local owner_pid="$1" poll="$2" home="$3" auth_backup="$4"
-  local auth_identity="$5" config_backup="$6" command="$7" guard_dir="$8"
+  local auth_identity="$5" config_backup="$6" command="$7" guard_dir="$8" runtime_home="${9:-}"
+  local runtime_signature="" trusted_signature="" observed_runtime observed_trusted
   local auth="$home/.codex/auth.json" config="$home/.codex/config.toml"
   local auth_signature="" config_signature="" current_auth current_config
+  local contested=0 beat_every beat
+  beat_every="${CODEX_PROFILE_GUARD_HEARTBEAT_SECONDS:-600}"
+  [[ "$beat_every" =~ ^[0-9]+$ ]] || beat_every=600
+  beat=$SECONDS
   [ -z "$auth_backup" ] || auth_signature="$(guarded_file_signature "$auth")"
   [ -z "$config_backup" ] || config_signature="$(guarded_file_signature "$config")"
   while kill -0 "$owner_pid" 2>/dev/null; do
     sleep "$poll" || break
+    if [ ! -d "$guard_dir" ]; then
+      # A sweep on another host sharing this root, or a manual cleanup, can
+      # remove the guard directory while its session lives; recreate it and
+      # force a guard pass so the snapshots are re-verified and re-seeded
+      # instead of every snapshot update failing until the session ends.
+      mkdir -m 700 -- "$guard_dir" 2>/dev/null || continue
+      write_profile_guard_owner "$guard_dir" "$owner_pid"
+      if [ -n "$config_backup" ] && [ ! -e "$config_backup" ] &&
+        [ -f "$config" ] && [ ! -L "$config" ]; then
+        # The config baseline died with the directory and has no identity
+        # check to rebuild from; re-adopt the current config.
+        cp -p -- "$config" "$config_backup" 2>/dev/null || true
+        chmod 600 "$config_backup" 2>/dev/null || true
+      fi
+      auth_signature="guard-dir-recreated"
+      config_signature="guard-dir-recreated"
+      note "recreated profile guard dir after external removal: $guard_dir"
+    fi
+    if [ "$((SECONDS - beat))" -ge "$beat_every" ]; then
+      # mtime is the only liveness signal a sweep on another host can trust;
+      # keep a live guard directory younger than the sweep's stale age.
+      touch -c -- "$guard_dir" 2>/dev/null || true
+      beat=$SECONDS
+    fi
+    if [ -n "$runtime_home" ]; then
+      observed_runtime="$(guarded_file_signature "$runtime_home/auth.json")"
+      observed_trusted="$(guarded_file_signature "$home/.codex-profile-state/auth.json")"
+      if [ "$observed_runtime" != "$runtime_signature" ] ||
+        [ "$observed_trusted" != "$trusted_signature" ]; then
+        if "$BIN_DIR/codex-auth" sync --profile-home "$home" --runtime-home "$runtime_home"; then
+          # Record the signatures inspected before sync, so concurrent changes
+          # are not accidentally marked as already handled.
+          runtime_signature="$observed_runtime"
+          trusted_signature="$observed_trusted"
+        fi
+      fi
+    fi
     current_auth="$auth_signature"
     current_config="$config_signature"
     [ -z "$auth_backup" ] || current_auth="$(guarded_file_signature "$auth")"
     [ -z "$config_backup" ] || current_config="$(guarded_file_signature "$config")"
     if [ "$current_auth" != "$auth_signature" ] ||
       [ "$current_config" != "$config_signature" ]; then
-      guard_profile_once "$home" "$auth_backup" "$auth_identity" \
-        "$config_backup" "$command"
-      [ -z "$auth_backup" ] || auth_signature="$(guarded_file_signature "$auth")"
-      [ -z "$config_backup" ] || config_signature="$(guarded_file_signature "$config")"
+      if guard_profile_once "$home" "$auth_backup" "$auth_identity" \
+        "$config_backup" "$command" "$contested"; then
+        contested=0
+        [ -z "$auth_backup" ] || auth_signature="$(guarded_file_signature "$auth")"
+        [ -z "$config_backup" ] || config_signature="$(guarded_file_signature "$config")"
+      else
+        # Keep the signatures that were verified last so the next poll checks
+        # this change again, and report a contested guard once per streak.
+        contested=1
+      fi
     fi
   done
-  guard_profile_once "$home" "$auth_backup" "$auth_identity" \
+  guard_profile_until_verified "$home" "$auth_backup" "$auth_identity" \
     "$config_backup" "$command"
   cleanup_profile_guard "$guard_dir" "$auth_backup" "$config_backup"
 }
 
 run_launcher_with_profile_guard() {
   local home="$1" launcher="$2" lean_project="$3" runtime_home="$4" command="${5:-}"
-  local auth config tool poll allow_auth allow_config protect_auth=1 protect_config=0
+  local auth config tool poll lock_wait allow_auth allow_config protect_auth=1 protect_config=0
   local guard_dir auth_backup="" config_backup="" before="" status watcher_pid
   shift 4
+  command="$(runtime_command "$@")"
   auth="$runtime_home/auth.json"
   config="$runtime_home/config.toml"
   tool="$BIN_DIR/codex-history"
   poll="${CODEX_PROFILE_GUARD_POLL_SECONDS:-0.5}"
+  lock_wait="${CODEX_PROFILE_GUARD_LOCK_TIMEOUT_SECONDS:-20}"
   allow_auth="${CODEX_ALLOW_AUTH_IDENTITY_CHANGE:-0}"
   allow_config="${CODEX_ALLOW_PROFILE_CONFIG_CHANGE:-0}"
   [[ "$poll" =~ ^[0-9]+([.][0-9]+)?$ ]] && [[ "$poll" =~ [1-9] ]] ||
     die "CODEX_PROFILE_GUARD_POLL_SECONDS must be a positive number"
+  [[ "$lock_wait" =~ ^[0-9]+([.][0-9]+)?$ ]] && [[ "$lock_wait" =~ [1-9] ]] ||
+    die "CODEX_PROFILE_GUARD_LOCK_TIMEOUT_SECONDS must be a positive number"
   case "$allow_auth" in
     0|1) ;;
     *) die "CODEX_ALLOW_AUTH_IDENTITY_CHANGE must be 0 or 1" ;;
@@ -1534,13 +1728,6 @@ run_launcher_with_profile_guard() {
     [ "$command" = logout ] || [ ! -e "$auth" ]; then
     protect_auth=0
   fi
-  if [ "$protect_auth" -eq 0 ] && [ "$protect_config" -eq 0 ]; then
-    set +e
-    launch_codex_process "$launcher" "$lean_project" "$@"
-    status=$?
-    set -e
-    return "$status"
-  fi
   if [ "$protect_auth" -eq 1 ]; then
     [ -f "$auth" ] && [ ! -L "$auth" ] ||
       die "isolated auth path must be a regular file: $auth"
@@ -1551,8 +1738,16 @@ run_launcher_with_profile_guard() {
     [ -f "$config" ] && [ ! -L "$config" ] ||
       die "isolated config path must be a regular file: $config"
   fi
-  guard_dir="$(mktemp -d "/tmp/codex-profile-guard.$(id -u).XXXXXX")"
+  sweep_stale_guard_dirs "$(runtime_codex_home_root)"
+  guard_dir="$(mktemp -d "$(runtime_codex_home_root)/codex-profile-guard.XXXXXX")"
   chmod 700 "$guard_dir" 2>/dev/null || true
+  write_profile_guard_owner "$guard_dir" "$$"
+  # SIGTERM is how a supervisor normally stops a session; without these the copy
+  # of auth.json in the guard directory outlives the process.
+  trap 'cleanup_profile_guard "$guard_dir" "$auth_backup" "$config_backup"; cleanup_runtime_codex_home_on_exit' EXIT
+  trap 'trap - INT TERM HUP; exit 130' INT
+  trap 'trap - INT TERM HUP; exit 143' TERM
+  trap 'trap - INT TERM HUP; exit 129' HUP
   if [ "$protect_auth" -eq 1 ]; then
     auth_backup="$guard_dir/auth.json"
     cp -p -- "$auth" "$auth_backup"
@@ -1565,7 +1760,7 @@ run_launcher_with_profile_guard() {
   fi
 
   watch_profile_guard "$$" "$poll" "$home" "$auth_backup" "$before" \
-    "$config_backup" "$command" "$guard_dir" 9>&- &
+    "$config_backup" "$command" "$guard_dir" "$runtime_home" 9>&- &
   watcher_pid=$!
   set +e
   launch_codex_process "$launcher" "$lean_project" "$@"
@@ -1575,27 +1770,42 @@ run_launcher_with_profile_guard() {
   set +e
   wait "$watcher_pid" 2>/dev/null
   set -e
-  guard_profile_once "$home" "$auth_backup" "$before" "$config_backup" "$command"
+  guard_profile_until_verified "$home" "$auth_backup" "$before" \
+    "$config_backup" "$command"
+  trap - INT TERM HUP
+  trap cleanup_runtime_codex_home_on_exit EXIT
   cleanup_profile_guard "$guard_dir" "$auth_backup" "$config_backup"
   return "$status"
 }
 
 run_codex() {
   local home="$1" launcher tz host_home="${HOME:-}" lean_runner lean_project log_dir log_key runtime_path
-  local runtime_codex_home runtime_auth_before runtime_config_before
-  local expected_auth_identity="" command status repair_status finalize_status cleanup_status
+  local runtime_codex_home runtime_config_before
+  local command status repair_status finalize_status cleanup_status
   shift
   launcher="$(resolve_launcher)"
   tz="${CODEX_TZ:-$DEFAULT_TZ}"
   require_safe_env
+  [[ "${CODEX_RUNTIME_HOME_LOCK_TIMEOUT_SECONDS:-30}" =~ ^[0-9]+([.][0-9]+)?$ ]] &&
+    [[ "${CODEX_RUNTIME_HOME_LOCK_TIMEOUT_SECONDS:-30}" =~ [1-9] ]] ||
+    die "CODEX_RUNTIME_HOME_LOCK_TIMEOUT_SECONDS must be a positive number"
+  [[ "${CODEX_PROFILE_STATE_LOCK_TIMEOUT_SECONDS:-30}" =~ ^[0-9]+([.][0-9]+)?$ ]] &&
+    [[ "${CODEX_PROFILE_STATE_LOCK_TIMEOUT_SECONDS:-30}" =~ [1-9] ]] ||
+    die "CODEX_PROFILE_STATE_LOCK_TIMEOUT_SECONDS must be a positive number"
   launcher="$(local_runtime_launcher "$launcher")"
   ensure_shared_memory "$home" fast
   ensure_profile_launcher "$home"
   ensure_trusted_profile_state "$home"
   reject_shared_symlinks
   direct_profile_runtime_guard "$home"
-  if ! "$BIN_DIR/codex-history" repair-runtime-paths \
-    --runtime-root "$(runtime_codex_home_root)" --quiet; then
+  set +e
+  "$BIN_DIR/codex-history" repair-runtime-paths \
+    --runtime-root "$(runtime_codex_home_root)" --quiet
+  repair_status=$?
+  set -e
+  if [ "$repair_status" -eq 75 ]; then
+    note "left the temporary rollout paths to the next launch; the state database is busy"
+  elif [ "$repair_status" -ne 0 ]; then
     die "could not repair temporary rollout paths before launch"
   fi
   lean_project=""
@@ -1606,6 +1816,9 @@ run_codex() {
     fi
   fi
 
+  mkdir -p "$home/.cache/tmp"
+  chmod 700 "$home/.cache/tmp"
+  export TMPDIR="$home/.cache/tmp" TMP="$home/.cache/tmp" TEMP="$home/.cache/tmp"
   export HOME="$home"
   export CODEX_SHARED_SESSIONS_ROOT="$SHARED_CODEX_ROOT/sessions"
   log_dir="$home/.codex/log-dbs"
@@ -1627,26 +1840,20 @@ run_codex() {
   export PATH="$BIN_DIR:$runtime_path:$home/.local/bin:${host_home:+$host_home/.local/bin:}$PATH"
   # A launcher invoked from an existing Codex session inherits these markers.
   # They belong to the parent session, not to the profile being launched.
-  unset CODEX_THREAD_ID CODEX_SESSION_ID CODEX_CI
+  unset CODEX_THREAD_ID CODEX_SESSION_ID CODEX_TOOL_CALL_ID CODEX_CI
   case "${CODEX_ALLOW_PROFILE_CONFIG_CHANGE:-0}" in
     0) export CODEX_PROFILE_PRESERVE_MODEL_CONFIG=1 ;;
     1) unset CODEX_PROFILE_PRESERVE_MODEL_CONFIG ;;
     *) die "CODEX_ALLOW_PROFILE_CONFIG_CHANGE must be 0 or 1" ;;
   esac
   profile_concurrency_guard "$home" "$@"
-  command="${1:-}"
+  command="$(runtime_command "$@")"
   runtime_codex_home="$(prepare_runtime_codex_home "$home")"
   RUNTIME_CODEX_HOME_TO_CLEAN="$runtime_codex_home"
   trap cleanup_runtime_codex_home_on_exit EXIT
-  runtime_auth_before="$(runtime_file_digest "$runtime_codex_home/auth.json")"
   runtime_config_before="$(runtime_file_digest "$runtime_codex_home/config.toml")"
-  if [ "$runtime_auth_before" != missing ]; then
-    if [ "$runtime_auth_before" = unsupported ]; then
-      die "isolated runtime auth is not a regular file"
-    fi
-    expected_auth_identity="$("$BIN_DIR/codex-history" auth-identity \
-      --auth-file "$runtime_codex_home/auth.json")" || die "profile auth is invalid"
-  fi
+  "$BIN_DIR/codex-auth" init --runtime-home "$runtime_codex_home" --command="$command" ||
+    die "could not initialize runtime auth synchronization"
   export CODEX_HOME="$runtime_codex_home"
   set +e
   run_launcher_with_profile_guard "$home" "$launcher" "$lean_project" \
@@ -1655,8 +1862,11 @@ run_codex() {
   "$BIN_DIR/codex-history" repair-runtime-paths \
     --runtime-root "$(runtime_codex_home_root)" --quiet
   repair_status=$?
+  if [ "$repair_status" -eq 75 ]; then
+    repair_status=0
+  fi
   finalize_runtime_codex_home "$home" "$runtime_codex_home" "$command" \
-    "$runtime_auth_before" "$expected_auth_identity" "$runtime_config_before"
+    "$runtime_config_before"
   finalize_status=$?
   cleanup_runtime_codex_home "$runtime_codex_home"
   cleanup_status=$?
@@ -1762,7 +1972,7 @@ handoff_profile() {
   [[ "$session_id" =~ ^[0-9a-fA-F-]{36}$ ]] || die "invalid session id: $session_id"
   tool="$BIN_DIR/codex-history"
   [ -x "$tool" ] || die "history tool is missing or not executable: $tool"
-  tmp="$(mktemp /tmp/codex-handoff.XXXXXX)"
+  tmp="$(mktemp "$(runtime_codex_home_root)/codex-handoff.XXXXXX")"
   trap 'rm -f "$tmp"' RETURN
   cwd="$("$tool" handoff --session-id "$session_id" --output "$tmp")"
   [ -d "$cwd" ] || die "handoff working directory is missing: $cwd"
