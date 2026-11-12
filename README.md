@@ -1,27 +1,84 @@
-# codex_bundle
+# Codex Bundle
 
-Portable Codex CLI bundle with isolated account profiles and shared local
-memory/conversation state.
+[![Bundle checks](https://github.com/imathwy/codex_bundle/actions/workflows/ci.yml/badge.svg)](https://github.com/imathwy/codex_bundle/actions/workflows/ci.yml)
 
-The bundle derives paths from its own location. Runtime, active-profile, and
-shared-state links are relative, so the directory can be moved or cloned.
+A portable Codex CLI distribution for Linux x86_64 with isolated account
+profiles, persistent login, shared local sessions and memory, and Lean MCP
+integration. It includes a locally patched Codex runtime, launchers, and tools
+for importing, resuming, archiving, and restoring conversations.
+
+The bundle derives paths from its own location. You can move the directory
+between compatible Linux hosts while keeping account credentials separate and
+continuing to use the same local conversation store. Private profiles, memories,
+sessions, caches, and backups stay on your machine and are excluded from Git.
+
+## Features
+
+- **Separate accounts:** each profile has its own credentials, configuration,
+  plugins, and skills. Login and token refreshes are retained across launches.
+- **Shared local history:** profiles share conversations and explicit Codex
+  memory. Use a portable handoff when switching authentication domains.
+- **Portable runtime:** the bundled executable is reconstructed from verified
+  archive parts on first use. Running the bundle does not require a Rust build.
+- **Lean integration:** profiles include a Lean LSP MCP configuration, with
+  runtime and project paths adapted at launch.
+- **Reversible maintenance:** import existing history, archive older sessions,
+  restore them later, and check the installation with `doctor`.
+
+## Contents
+
+- [Quick start](#quick-start) and [proxy settings](#proxy-settings)
+- [Profiles and login](#profiles-and-login)
+- [Resume and cross-account handoff](#resume-and-cross-account-handoff)
+- [Authentication and configuration](#authentication-and-configuration)
+- [Session history and fast resume](#session-history-and-fast-resume)
+- [Lean LSP MCP](#lean-lsp-mcp) and [concurrent sessions](#concurrent-sessions)
+- [Shared memory model](#shared-memory-model) and [bundle layout](#bundle-layout)
+- [History archiving](#reversible-history-archiving) and [importing state](#importing-existing-state)
+- [Runtime](#runtime), [updating the bundle](#updating-the-bundle), and [updating the runtime](#updating-the-runtime)
+- [Safety defaults](#safety-defaults), [automated checks](#automated-checks), and [contributing](#before-pushing)
 
 ## Quick start
 
-Requires Linux x86_64, Bash, Python 3.10+, `flock`, `tar` and `sha256sum`.
+Requires Linux x86_64, Bash, Python 3.10+, `flock`, `tar`, and GNU core utilities
+including `sha256sum` and `realpath`. Git is needed to clone and update the
+repository. Python 3.10 uses the included TOML parser; no additional Python
+packages are required for the launcher.
+
+If your shell has proxy variables set, follow [Proxy settings](#proxy-settings)
+before running the commands below.
 
 ```bash
+git clone --depth 1 https://github.com/imathwy/codex_bundle.git
+cd codex_bundle
+
 ./bin/codex-profile doctor
-./bin/codex-profile list
+./bin/codex-profile init account-a
+./bin/codex-profile run account-a -- login
+./bin/codex-profile run account-a -- login status
+./bin/codex-profile switch account-a
 ./bin/codex
 ```
 
-If your shell intentionally uses a proxy, export the opt-in before running:
+The shallow clone downloads the current bundle without the older Git history.
+`doctor` reconstructs a missing runtime from the tracked archive parts and
+checks its integrity. Follow the login command's prompts to authenticate your
+account; later `run` and `resume` commands reuse that profile's saved login.
+
+New profiles default to `gpt-6.1-sol`. Edit `model` in
+`profiles/account-a/.codex/config.toml` to choose a model available to your
+account, or pass `--model` for one launch.
+
+### Proxy settings
+
+The launcher requires an explicit opt-in when proxy variables are present.
+If the proxy is intentional, export the opt-in before running:
 
 ```bash
 export CODEX_ALLOW_PROXY=1
-./bin/codex-profile run account-a
-# Or allow it for just one command:
+./bin/codex-profile doctor
+
+# Or allow it for one command after creating account-a:
 CODEX_ALLOW_PROXY=1 ./bin/codex-profile run account-a
 ```
 
@@ -29,25 +86,44 @@ In Bash, `set CODEX_ALLOW_PROXY=1` sets a positional argument; it does not
 export an environment variable. Unset unwanted proxy variables instead of
 opting in. This flag permits the configured proxy; it does not configure one.
 
-New profiles default to `gpt-6.1-sol`. Change `model` in the profile's
-`.codex/config.toml` to select a different default, or pass `--model` for one launch.
+### Add the bundle to PATH
 
-Create one profile per ChatGPT/OpenAI account:
+From the bundle directory, load the helper for your shell:
 
 ```bash
-./bin/codex-profile init account-a
-./bin/codex-profile run account-a
-./bin/codex-profile init account-b
-./bin/codex-profile run account-b
+source ./bin/env       # Bash or Zsh
 ```
 
-Switch the default account and resume shared sessions:
+Fish users can run `source ./bin/env.fish`. You can then invoke `codex-profile`
+and `codex` without the `./bin/` prefix.
+
+## Profiles and login
+
+Create one profile per ChatGPT/OpenAI account. For another account:
 
 ```bash
-./bin/codex-profile switch account-a
-./bin/codex
-./bin/codex-profile resume
+./bin/codex-profile init account-b
+./bin/codex-profile run account-b -- login
+./bin/codex-profile run account-b -- login status
+```
 
+| Task | Command |
+| --- | --- |
+| List profiles | `./bin/codex-profile list` |
+| Show the active profile | `./bin/codex-profile current` |
+| Set the default profile | `./bin/codex-profile switch account-a` |
+| Start with a specific profile | `./bin/codex-profile run account-a` |
+| Start with the active profile | `./bin/codex` |
+| Sign out of a specific profile | `./bin/codex-profile run account-a -- logout` |
+| Show all launcher commands and settings | `./bin/codex-profile help` |
+
+## Resume and cross-account handoff
+
+Resume with the active profile, or select a profile explicitly:
+
+```bash
+./bin/codex-profile resume
+./bin/codex-profile resume account-a -- <session-id>
 ./bin/codex-profile resume-last account-b
 ./bin/codex-profile resume-last account-b -- --all
 ./bin/codex-profile resume account-b -- --all
@@ -77,7 +153,9 @@ domain and exact continuation is required.
 ./bin/codex-profile resume -- <session-id>
 ```
 
-Every launch now gives the runtime a private, mode-`0700` `CODEX_HOME` under
+## Authentication and configuration
+
+Every launch gives the runtime a private, mode-`0700` `CODEX_HOME` under
 `<bundle>/.work/runtime-homes-<uid>/`. Its `auth.json` and `config.toml` are copied from the selected profile's
 authoritative `.codex-profile-state` directory; established non-sensitive state
 and shared sessions/databases are linked back to their normal locations. New and
@@ -92,8 +170,8 @@ home and are discarded by default. This keeps credentials protected while
 allowing normal manual configuration changes when several containers mount the
 same profile through GPFS.
 
-This isolates TUI-internal conversation transitions. In particular, `/new`,
-`/btw` (the `/side` alias), `/side`, and `/fork` may rewrite their runtime
+This isolates conversation transitions inside the terminal interface. In
+particular, `/new`, `/btw` (also available as `/side`), and `/fork` may rewrite their runtime
 copies without overwriting the selected profile. Config changes are discarded
 on exit by default. Initial login, same-account token refreshes and explicit
 login/logout are synchronized into trusted state while the window is open
@@ -120,7 +198,7 @@ The active Lean project is passed to Codex as a per-process `-c` override.
 Launching or forking from another repository therefore does not persistently
 rewrite `mcp_servers.lean-lsp.env.LEAN_PROJECT_PATH` or race another session.
 
-### Fast resume
+## Session history and fast resume
 
 Auth identities are checked at the isolated-home boundary. API keys are
 fingerprinted locally and OAuth profiles are identified by `account_id`; secret
@@ -153,8 +231,8 @@ without opening the picker:
 ```
 
 Codex's `--last` path consults its indexed state database first. Passing an
-exact session UUID through `run <name> -- resume <UUID>` is also fast. Use
-`run <name> resume --all` only when you need sessions from every directory.
+exact session UUID through `resume <name> -- <UUID>` is also fast. Use
+`resume <name> -- --all` when you need sessions from every directory.
 The current-directory picker still scans rollout JSONL files to repair metadata,
 so its initial load time grows with the shared session archive.
 
@@ -184,7 +262,7 @@ the same working directory. Register their `CODEX_HOME` as a history-only
 source, optionally limited to one exact project:
 
 ```bash
-./bin/codex-profile import-history /root/.codex \
+./bin/codex-profile import-history /absolute/path/to/source/.codex \
   --cwd /absolute/project/path
 ```
 
@@ -234,7 +312,7 @@ The legacy-process guard scans `/proc` in one Python process. It still rejects
 Codex runtimes using the selected profile's persistent `CODEX_HOME`, without
 spawning a separate `readlink` process for every process on a busy host.
 
-### Many concurrent sessions of one profile
+## Concurrent sessions
 
 Launch and exit bookkeeping takes per-profile locks: the trusted state, the
 profile config, the profile files, and the merge of the isolated runtime home.
@@ -280,6 +358,21 @@ resolves the link and places WAL/SHM files beside that shared database, so
 concurrent profiles use one journal rather than diverging per-profile journals.
 The next model request still uses the credentials from the profile that started
 that Codex process.
+
+## Bundle layout
+
+| Path | Purpose | Published in Git |
+| --- | --- | --- |
+| `bin/` | Launchers, maintenance tools, `uv`, and `uvx` | Yes |
+| `lib/` | Python compatibility support | Yes |
+| `runtime/codex/current` | Relative link selecting the active runtime | Yes |
+| `runtime/codex/versions/*.parts/` | Split runtime archive and checksums | Current release only |
+| `runtime/codex/versions/<version>/` | Reconstructed runtime files | No |
+| `profiles/` | Account credentials, configuration, plugins, and caches | Placeholders only |
+| `shared/codex/` | Local sessions, history, memory, and databases | Placeholder only |
+| `backups/` | Profile backups and archived sessions | Placeholder only |
+| `.work/` | Private runtime homes, build files, caches, and temporary files | No |
+| `tests/` and `.github/workflows/` | Regression tests and automated checks | Yes |
 
 ## Reversible history archiving
 
@@ -390,7 +483,7 @@ their archives are retained locally for rollback and are ignored.
 
 The runtime includes the locally built code-mode host, standalone exec-server, and bwrap. Its `rg` is
 fetched and verified using the upstream package manifest.
-The bundled `uv` and `uvx` runners are upgraded to 0.13.7. A relocatable
+The bundled `uv` and `uvx` runners are version 0.13.7. A relocatable
 Git 2.55.0 is included on `codex-path` so worktree operations support the newer
 Git options used by Codex. The system Git installation is unchanged.
 
@@ -407,9 +500,36 @@ create a second inode for another new writer. Restart existing Codex windows
 after upgrading: already-running older binaries do not gain this protection,
 and replacing the runtime link does not stop their rollout writers.
 
-The 0.167.2 upgrade passed 29 bundle regression tests, 4 runtime writer-lock
-tests, 33 protocol tests, and runtime/archive checksum checks. Local upgrade
-execution reports and host-specific diagnostics are not published.
+The current bundle regression suite is described under
+[Automated checks](#automated-checks). The 0.167.2 runtime build also passed
+4 runtime writer-lock tests, 33 protocol tests, and runtime/archive checksum
+checks. Local upgrade execution reports and host-specific diagnostics are not
+published.
+
+### Process and terminal behavior
+
+The launcher passes `--no-daemon` for new sessions, resume, and fork. Codex uses
+an embedded service that exits with the interactive client; it does not start
+a separate app-server daemon or wait for that daemon's control socket.
+
+All profiles use normal terminal scrollback by default:
+`tui.raw_output_mode = false` and `tui.alternate_screen = "never"`. These
+settings keep tool output compact and preserve terminal scrollback. Restart
+existing Codex windows after changing launcher defaults.
+
+## Updating the bundle
+
+To receive the published launcher, documentation, and packaged runtime updates:
+
+```bash
+git pull --ff-only
+./bin/codex-profile doctor
+```
+
+Your ignored profiles and shared local memory remain in place. Restart existing
+Codex windows to use the updated launcher and runtime.
+
+## Updating the runtime
 
 Use the bundled updater to check or install the latest stable Codex release:
 
@@ -449,7 +569,7 @@ See `SECURITY.md` for the detailed model.
 
 ## Automated checks
 
-GitHub Actions runs the regression suite on Python 3.10 and 3.12 for pushes to
+GitHub Actions runs the 40-test regression suite on Python 3.10 and 3.12 for pushes to
 `main` and pull requests. It exports only tracked files, reconstructs the split
 runtime, verifies SHA-256 manifests, boots the CLI, and checks a moved bundle
 with a legacy Lean MCP path. These checks use temporary profiles and no login
@@ -506,6 +626,9 @@ overrides. The workspace cache may be slower than node-local storage on GPFS;
 Existing windows must be restarted to load these launcher defaults and global
 instructions. Existing files in container-local directories are not removed.
 
-启动器统一传入 `--no-daemon`，包括新会话、resume 和 fork，直接使用随交互进程退出的内嵌服务，不再启动后台 app-server daemon 或等待其控制 socket。0.167.2 的 `agents --no-daemon` 也支持这种方式。
+## Upstream components and licenses
 
-所有 profile 的启动器默认使用普通 scrollback（`tui.raw_output_mode = false`、`tui.alternate_screen = "never"`），保持工具输出精简并保留终端滚动历史。新会话、resume 和 fork 均应用，重启已有窗口后生效。
+This bundle includes a locally patched build of
+[OpenAI Codex](https://github.com/openai/codex) and other third-party tools.
+See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for component versions and
+source references, and [LICENSES/](LICENSES/) for bundled license texts.
